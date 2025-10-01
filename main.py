@@ -19,7 +19,7 @@ config = {
     "data_root": os.environ.get("RICO_DATA", "/Users/jure/PhD/coding/RICO_1hr"),
 
     # vertical level index
-    "z_index": 1,
+    "z_index": 2,
 
     # time index of the first panel and the time in indices between panels
     "start_index": 0,
@@ -46,6 +46,14 @@ config = {
     # outputs
     "outfile": "cold_pools_panels.png",
     "outfile_wind_anom": "cold_pools_panels_anom.png",
+    
+    # gif options
+    "make_tracking_gif": True,           # single-panel, minute-by-minute GIF
+    "gif_minutes": 20,                    # number of frames (minutes)
+    # region center and half-window in km in domain coords
+    "gif_center_km": (0.0, 0.0),          # (x0_km, y0_km)
+    "gif_half_window_km": (2.0, 2.0),     # (hx_km, hy_km)
+    "gif_outfile": "cold_pools_tracking.gif",
 }
 
 
@@ -70,6 +78,11 @@ def main():
         arrow_scale=config["arrow_scale"],
         outfile=config["outfile"],
         outfile_wind_anom=config["outfile_wind_anom"],
+        make_tracking_gif=config["make_tracking_gif"],
+        gif_minutes=config["gif_minutes"],
+        gif_center_km=config["gif_center_km"],
+        gif_half_window_km=config["gif_half_window_km"],
+        gif_outfile=config["gif_outfile"],
     )
 
 

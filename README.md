@@ -14,3 +14,7 @@ Run
 Notes
 - If `rico.r.nc` is missing, rain is set to zero.
 - The second PNG uses wind anomalies (mean wind removed).
+
+Sample gif (tracking mean winds)
+
+![Cold pools tracking](cold_pools_sample.gif)

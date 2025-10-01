@@ -269,9 +269,151 @@ def panel_plot(
 
     # Colorbar
     cbar = fig.colorbar(im, ax=axes.tolist(), shrink=0.95, pad=0.02)
-    cbar.set_label(r"$\theta_v$ (K)")
+    cbar.set_label("theta_v (K)")
 
     fig.savefig(outfile, dpi=400)
+    return outfile
+
+
+def _advect_window(center_xy_km: Tuple[float, float], minutes_since_start: float,
+                   mean_wind_ms: Tuple[float, float]) -> Tuple[float, float]:
+    """Return new center (km) after advection with mean wind for given minutes.
+
+    mean_wind_ms is (u_mean, v_mean) in m/s on domain. Convert to km/min.
+    """
+    u_ms, v_ms = mean_wind_ms
+    factor = 60.0  # seconds per minute
+    dx_km = (u_ms * minutes_since_start * factor) / 1000.0
+    dy_km = (v_ms * minutes_since_start * factor) / 1000.0
+    xk, yk = center_xy_km
+    return xk + dx_km, yk + dy_km
+
+
+def render_tracking_gif(
+    data_root: str,
+    start_index: int,
+    minutes: int,
+    z_index: int,
+    center_km: Tuple[float, float],
+    half_window_km: Tuple[float, float],
+    outfile: str,
+    colormap: Optional[str] = None,
+    arrow_subsample: int = 8,
+    arrow_scale: float = 100,
+):
+    """Render a GIF following a fixed-size window advected by domain-mean wind.
+
+    - One panel per frame
+    - Wind arrows shown as anomalies (domain mean removed)
+    - Frames are minute-by-minute indices starting at start_index
+    """
+    import imageio.v2 as imageio
+
+    # Load time axis
+    t_values, ntime = _time_values_and_count(data_root)
+    # Map minutes to indices by assuming 60 s per minute time axis spacing in seconds.
+    # Here we interpret "minute-by-minute" as contiguous time indices, as files are in seconds.
+    idx = start_index + np.arange(minutes)
+    if np.any(idx >= ntime):
+        raise IndexError("Chosen GIF frames exceed available timesteps.")
+
+    # Grid from a base file to get coordinates
+    with _open(os.path.join(data_root, "rico.p.nc")) as dsp:
+        xt_full = dsp["xt"].values
+        yt_full = dsp["yt"].values
+
+    # helper to convert km window to index slices, clamped to domain
+    def window_indices(x_center_km: float, y_center_km: float, hx_km: float, hy_km: float):
+        x_km = xt_full / 1000.0
+        y_km = yt_full / 1000.0
+        x0 = x_center_km - hx_km
+        x1 = x_center_km + hx_km
+        y0 = y_center_km - hy_km
+        y1 = y_center_km + hy_km
+        ix0 = int(np.searchsorted(x_km, x0, side="left"))
+        ix1 = int(np.searchsorted(x_km, x1, side="right"))
+        iy0 = int(np.searchsorted(y_km, y0, side="left"))
+        iy1 = int(np.searchsorted(y_km, y1, side="right"))
+        ix0 = max(0, min(ix0, len(xt_full)-1))
+        ix1 = max(ix0+1, min(ix1, len(xt_full)))
+        iy0 = max(0, min(iy0, len(yt_full)-1))
+        iy1 = max(iy0+1, min(iy1, len(yt_full)))
+        return (ix0, ix1, iy0, iy1)
+
+    # Prepare frames
+    frames = []
+
+    # Determine default colormap once
+    if colormap is None:
+        colormap = "cmo.thermal" if "cmo.thermal" in plt.colormaps() else ("cmocean.thermal" if "cmocean.thermal" in plt.colormaps() else "viridis")
+
+    # Track center advected by domain-mean wind using instantaneous means each frame
+    xck, yck = center_km
+    hxk, hyk = half_window_km
+
+    t0 = t_values[idx[0]]
+
+    for t_i in idx:
+        # Compute fields on full domain at this time to get means and subdomain
+        results = compute_fields_for_indices(
+            data_root=data_root,
+            t_indices=[t_i],
+            z_index=z_index,
+            xlim_km=None,
+            ylim_km=None,
+            use_clear_air_reference=True,
+            threshold_kgkg=5e-5,
+            rain_filename="rico.r.nc",
+        )
+        r = results[0]
+
+        # Update advection based on domain-mean wind up to current time
+        minutes_since_start = int(round((t_values[t_i] - t0) / 60.0))
+        xck, yck = _advect_window(center_xy_km=(center_km[0], center_km[1]),
+                                  minutes_since_start=minutes_since_start,
+                                  mean_wind_ms=(r["u_mean"], r["v_mean"]))
+
+        ix0, ix1, iy0, iy1 = window_indices(xck, yck, hxk, hyk)
+
+        # Crop fields
+        xt = r["xt"][ix0:ix1] / 1000.0
+        yt = r["yt"][iy0:iy1] / 1000.0
+        X, Y = np.meshgrid(xt, yt)
+        thv = r["theta_v"][iy0:iy1, ix0:ix1]
+        B = r["B"][iy0:iy1, ix0:ix1]
+        u = r["u"][iy0:iy1, ix0:ix1] - r["u_mean"]
+        v = r["v"][iy0:iy1, ix0:ix1] - r["v_mean"]
+
+        # Figure
+        fig, ax = plt.subplots(figsize=(5.2, 5.2))
+        vmin = np.nanpercentile(thv, 2)
+        vmax = np.nanpercentile(thv, 98)
+        im = ax.pcolormesh(X, Y, thv, shading="auto", cmap=colormap, vmin=vmin, vmax=vmax)
+        try:
+            ax.contour(X, Y, B, levels=[0.0], colors="white", linewidths=1.0)
+        except Exception:
+            pass
+
+        step = max(1, int(arrow_subsample))
+        ax.quiver(X[::step, ::step], Y[::step, ::step], u[::step, ::step], v[::step, ::step],
+                  color="black", scale=arrow_scale, width=0.002)
+
+        minutes_rel = int(round((t_values[t_i] - t0) / 60.0))
+        ax.set_title(f"timestep {t_i} (t = {minutes_rel} min), z ~ {r['z']:.1f} m")
+        ax.set_xlabel("x (km)")
+        ax.set_ylabel("y (km)")
+        cbar = fig.colorbar(im, ax=ax, shrink=0.9, pad=0.02)
+        cbar.set_label("theta_v (K)")
+
+        fig.canvas.draw()
+        # Convert figure to image array
+        fig_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        fig_array = fig_array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+        frames.append(fig_array)
+        plt.close(fig)
+
+    # Save GIF (10 fps => 6s for 60 frames; we want 1 fps)
+    imageio.mimsave(outfile, frames, fps=1)
     return outfile
 
 
@@ -299,6 +441,11 @@ def main(
     arrow_scale: float = 100,
     outfile: str = "cold_pools_panels.png",
     outfile_wind_anom: Optional[str] = None,
+    make_tracking_gif: bool = False,
+    gif_minutes: int = 0,
+    gif_center_km: Tuple[float, float] = (0.0, 0.0),
+    gif_half_window_km: Tuple[float, float] = (2.0, 2.0),
+    gif_outfile: Optional[str] = None,
 ):
     idx, t_values = choose_time_indices(
         start_index=start_index,
@@ -340,6 +487,21 @@ def main(
             subtract_mean_wind=True,
         )
         print(f"Saved: {out2}")
+
+    if make_tracking_gif and gif_minutes > 0 and gif_outfile:
+        gif_path = render_tracking_gif(
+            data_root=data_root,
+            start_index=start_index,
+            minutes=gif_minutes,
+            z_index=z_index,
+            center_km=gif_center_km,
+            half_window_km=gif_half_window_km,
+            outfile=gif_outfile,
+            colormap=colormap,
+            arrow_subsample=arrow_subsample,
+            arrow_scale=arrow_scale,
+        )
+        print(f"Saved: {gif_path}")
 
 
 if __name__ == "__main__":
