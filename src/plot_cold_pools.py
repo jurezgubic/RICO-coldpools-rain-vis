@@ -260,9 +260,10 @@ def panel_plot(
         Ys = Y[::step, ::step]
         ax.quiver(Xs, Ys, u_s, v_s, color="black", scale=arrow_scale, width=0.002)
 
-        # Title with relative time
-        minutes = int(round((time_values[r["time_index"]] - t0) / 60.0))
-        ax.set_title(f"t = {minutes} min, z ≈ {r['z']:.1f} m")
+        # Title with timestep index and relative time
+        ti = r["time_index"]
+        minutes = int(round((time_values[ti] - t0) / 60.0))
+        ax.set_title(f"timestep {ti} (t = {minutes} min), z ~ {r['z']:.1f} m")
         ax.set_xlabel("x (km)")
         ax.set_ylabel("y (km)")
 
