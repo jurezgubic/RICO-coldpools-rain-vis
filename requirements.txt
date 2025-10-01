@@ -1,0 +1,7 @@
+numpy
+xarray
+netCDF4
+matplotlib
+cmocean
+scipy
+

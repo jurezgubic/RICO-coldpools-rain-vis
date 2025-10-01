@@ -1,0 +1,356 @@
+import os
+from typing import Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+import xarray as xr
+import matplotlib.pyplot as plt
+
+from .physics import calculate_physics_variables, _ensure_kgkg, g
+
+
+def _open(path: str) -> xr.Dataset:
+    # Keep numeric time axis in seconds; we only need relative minutes.
+    return xr.open_dataset(path, decode_times=False)
+
+
+def _nearest_index(values: np.ndarray, target: float) -> int:
+    return int(np.argmin(np.abs(values - target)))
+
+
+def _load_time_coord(ds: xr.Dataset) -> np.ndarray:
+    t = ds["time"].values
+    return t
+
+
+def _time_values_and_count(data_root: str) -> Tuple[np.ndarray, int]:
+    """Return raw time values and count from a base file.
+
+    We assume all files share the same time axis length (per user instruction).
+    """
+    with _open(os.path.join(data_root, "rico.p.nc")) as ds:
+        t = ds["time"].values
+    return t, int(t.shape[0])
+
+
+def _get2d_by_index(ds_path: str, var: str, t_index: int, z_index: int,
+                    x_name: str = "xt", y_name: str = "yt") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load a single (yt, xt) 2D slice at given time index and z index."""
+    with _open(ds_path) as ds:
+        da = ds[var].isel(time=t_index, zt=z_index)
+        x = np.array(ds[x_name].values)
+        y = np.array(ds[y_name].values)
+        arr = da.load().values.astype(float)
+        # Mask fill values if present
+        fill = da.attrs.get("_FillValue", None)
+        if fill is not None:
+            arr = np.where(arr == fill, np.nan, arr)
+    return arr, x, y
+
+
+def _interp_to_center(u_da: xr.DataArray, xt: np.ndarray = None, yt: np.ndarray = None) -> xr.DataArray:
+    """Interpolate staggered winds to cell centers.
+
+    u has dims (.., yt, xm) so it is staggered in x; v has dims (.., ym, xt)
+    so it is staggered in y. Scalars (p, t, q*, θv) are at (.., yt, xt).
+    We bring winds onto centers so arrows line up with scalars.
+    """
+    kwargs = {}
+    if xt is not None and "xm" in u_da.dims:
+        kwargs["xm"] = xt
+    if yt is not None and "ym" in u_da.dims:
+        kwargs["ym"] = yt
+    if not kwargs:
+        return u_da
+    return u_da.interp(**kwargs)
+
+
+def _winds_at_level_by_index(data_root: str, t_index: int, z_index: int,
+                             xt: np.ndarray, yt: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Return u,v on (yt, xt) at time index and z index."""
+    # u: dims (time, zt, yt, xm)
+    with _open(os.path.join(data_root, "rico.u.nc")) as dsu:
+        u_da = dsu["u"].isel(time=t_index, zt=z_index)
+        u_da = _interp_to_center(u_da, xt=xt)
+        u = u_da.load().values.astype(float)
+        fill = u_da.attrs.get("_FillValue", None)
+        if fill is not None:
+            u = np.where(u == fill, np.nan, u)
+
+    # v: dims (time, zt, ym, xt)
+    with _open(os.path.join(data_root, "rico.v.nc")) as dsv:
+        v_da = dsv["v"].isel(time=t_index, zt=z_index)
+        v_da = _interp_to_center(v_da, yt=yt)
+        v = v_da.load().values.astype(float)
+        fill = v_da.attrs.get("_FillValue", None)
+        if fill is not None:
+            v = np.where(v == fill, np.nan, v)
+
+    return u, v
+
+
+def _format_minutes_since(t0: float, t: float) -> int:
+    return int(round((t - t0) / 60.0))
+
+
+def compute_fields_for_indices(
+    data_root: str,
+    t_indices: Sequence[int],
+    z_index: int,
+    xlim_km: Optional[Tuple[float, float]] = None,
+    ylim_km: Optional[Tuple[float, float]] = None,
+    use_clear_air_reference: bool = True,
+    threshold_kgkg: float = 5e-5,
+    rain_filename: str = "rico.r.nc",
+) -> List[dict]:
+    """Compute theta_v, density, winds and buoyancy for given time indices at level index.
+
+    Returns list of dicts for each time index with fields and coordinates. Applies
+    optional spatial cropping to the same subdomain for all fields.
+    """
+    # Grid from pressure file
+    with _open(os.path.join(data_root, "rico.p.nc")) as dsp:
+        z = dsp["zt"].values
+        xt = dsp["xt"].values
+        yt = dsp["yt"].values
+
+    # Determine crop indices if any
+    x_km = xt / 1000.0
+    y_km = yt / 1000.0
+    if xlim_km is None:
+        ix0, ix1 = 0, len(xt)
+    else:
+        ix0 = int(np.searchsorted(x_km, xlim_km[0], side="left"))
+        ix1 = int(np.searchsorted(x_km, xlim_km[1], side="right"))
+    if ylim_km is None:
+        iy0, iy1 = 0, len(yt)
+    else:
+        iy0 = int(np.searchsorted(y_km, ylim_km[0], side="left"))
+        iy1 = int(np.searchsorted(y_km, ylim_km[1], side="right"))
+
+    xt_sub = xt[ix0:ix1]
+    yt_sub = yt[iy0:iy1]
+
+    rain_path = os.path.join(data_root, rain_filename)
+    have_rain = os.path.exists(rain_path)
+    if not have_rain:
+        print("no rain file")
+
+    results = []
+    for ti in t_indices:
+        # Scalars at centers and crop
+        p2d, _, _ = _get2d_by_index(os.path.join(data_root, "rico.p.nc"), "p", ti, z_index)
+        p2d = p2d[iy0:iy1, ix0:ix1]
+
+        thl2d, _, _ = _get2d_by_index(os.path.join(data_root, "rico.t.nc"), "t", ti, z_index)
+        thl2d = thl2d[iy0:iy1, ix0:ix1]
+
+        qt2d, _, _ = _get2d_by_index(os.path.join(data_root, "rico.q.nc"), "q", ti, z_index)
+        qt2d = qt2d[iy0:iy1, ix0:ix1]
+
+        ql2d, _, _ = _get2d_by_index(os.path.join(data_root, "rico.l.nc"), "l", ti, z_index)
+        ql2d = ql2d[iy0:iy1, ix0:ix1]
+
+        qr2d = None
+        if have_rain:
+            try:
+                qr2d, _, _ = _get2d_by_index(rain_path, "r", ti, z_index)
+                qr2d = qr2d[iy0:iy1, ix0:ix1]
+            except Exception:
+                qr2d = None
+
+        # unit conversions for water species
+        qt2d = _ensure_kgkg(qt2d)
+        ql2d = _ensure_kgkg(ql2d)
+        qr2d = _ensure_kgkg(qr2d) if qr2d is not None else 0.0
+
+        # physics
+        T2d, rho2d, thv2d, _B_domain = calculate_physics_variables(p2d, thl2d, ql2d, qt2d, qr2d)
+
+        # reference for buoyancy
+        if use_clear_air_reference:
+            thr = float(threshold_kgkg)
+            mask = (ql2d + (qr2d if isinstance(qr2d, np.ndarray) else qr2d)) < thr
+            if np.any(mask):
+                thv_ref = np.nanmean(thv2d[mask])
+            else:
+                thv_ref = np.nanmean(thv2d)
+        else:
+            thv_ref = np.nanmean(thv2d)
+
+        B2d = g * (thv2d - thv_ref) / thv_ref
+
+        # Winds: load full domain, compute domain-mean, then crop
+        u_full, v_full = _winds_at_level_by_index(data_root, ti, z_index, xt=xt, yt=yt)
+        u_mean = float(np.nanmean(u_full))
+        v_mean = float(np.nanmean(v_full))
+        u2d = u_full[iy0:iy1, ix0:ix1]
+        v2d = v_full[iy0:iy1, ix0:ix1]
+
+        results.append({
+            "time_index": ti,
+            "theta_v": thv2d,
+            "rho": rho2d,
+            "B": B2d,
+            "u": u2d,
+            "v": v2d,
+            "u_mean": u_mean,
+            "v_mean": v_mean,
+            "xt": xt_sub,
+            "yt": yt_sub,
+            "z": z[z_index],
+        })
+
+    return results
+
+
+def panel_plot(
+    results: List[dict],
+    time_values: np.ndarray,
+    outfile: str = "cold_pools_panels.png",
+    colormap: Optional[str] = None,
+    arrow_subsample: int = 8,
+    arrow_scale: float = 100,
+    subtract_mean_wind: bool = False,
+):
+    n = len(results)
+    ncols = 3 if n >= 3 else n
+    nrows = int(np.ceil(n / ncols))
+
+    # Global color limits for consistent shading
+    all_thv = np.concatenate([np.ravel(r["theta_v"]) for r in results])
+    vmin = np.nanpercentile(all_thv, 2)
+    vmax = np.nanpercentile(all_thv, 98)
+
+    # Choose default colormap if not specified by config
+    if colormap is None:
+        colormap = "cmo.thermal" if "cmo.thermal" in plt.colormaps() else ("cmocean.thermal" if "cmocean.thermal" in plt.colormaps() else "viridis")
+
+    # arrow sub-sampling for readability
+    def subsample(arr, step=arrow_subsample):
+        return arr[::step, ::step]
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.8*ncols, 4.8*nrows), constrained_layout=True)
+    if not isinstance(axes, np.ndarray):
+        axes = np.array([axes])
+    axes = axes.ravel()
+
+    t0 = time_values[results[0]["time_index"]]
+
+    for ax, r in zip(axes, results):
+        xt = r["xt"]/1000.0
+        yt = r["yt"]/1000.0
+        X, Y = np.meshgrid(xt, yt)
+
+        im = ax.pcolormesh(X, Y, r["theta_v"], shading="auto", cmap=colormap, vmin=vmin, vmax=vmax)
+
+        # Buoyancy zero contour (cold-pool edge)
+        try:
+            cs = ax.contour(X, Y, r["B"], levels=[0.0], colors="white", linewidths=1.0)
+        except Exception:
+            cs = None
+
+        # winds (thin sampling) plotted as arrows
+        step = max(1, int(arrow_subsample))
+        u_s = subsample(r["u"], step)
+        v_s = subsample(r["v"], step)
+        if subtract_mean_wind:
+            u_s = u_s - r["u_mean"]
+            v_s = v_s - r["v_mean"]
+        Xs = X[::step, ::step]
+        Ys = Y[::step, ::step]
+        ax.quiver(Xs, Ys, u_s, v_s, color="black", scale=arrow_scale, width=0.002)
+
+        # Title with relative time
+        minutes = int(round((time_values[r["time_index"]] - t0) / 60.0))
+        ax.set_title(f"t = {minutes} min, z ≈ {r['z']:.1f} m")
+        ax.set_xlabel("x (km)")
+        ax.set_ylabel("y (km)")
+
+    # Colorbar
+    cbar = fig.colorbar(im, ax=axes.tolist(), shrink=0.95, pad=0.02)
+    cbar.set_label(r"$\theta_v$ (K)")
+
+    fig.savefig(outfile, dpi=400)
+    return outfile
+
+
+def choose_time_indices(start_index: int, time_stride: int, n_panels: int, data_root: str) -> Tuple[np.ndarray, np.ndarray]:
+    t_values, ntime = _time_values_and_count(data_root)
+    idx = start_index + np.arange(n_panels) * time_stride
+    if np.any(idx >= ntime):
+        raise IndexError("Chosen time indices exceed available timesteps.")
+    return idx, t_values
+
+
+def main(
+    data_root: str,
+    start_index: int = 0,
+    time_stride: int = 10,
+    n_panels: int = 6,
+    z_index: int = 2,
+    xlim_km: Optional[Tuple[float, float]] = None,
+    ylim_km: Optional[Tuple[float, float]] = None,
+    use_clear_air_reference: bool = True,
+    threshold_kgkg: float = 5e-5,
+    rain_filename: str = "rico.r.nc",
+    colormap: Optional[str] = None,
+    arrow_subsample: int = 8,
+    arrow_scale: float = 100,
+    outfile: str = "cold_pools_panels.png",
+    outfile_wind_anom: Optional[str] = None,
+):
+    idx, t_values = choose_time_indices(
+        start_index=start_index,
+        time_stride=time_stride,
+        n_panels=n_panels,
+        data_root=data_root,
+    )
+
+    results = compute_fields_for_indices(
+        data_root=data_root,
+        t_indices=idx,
+        z_index=z_index,
+        xlim_km=xlim_km,
+        ylim_km=ylim_km,
+        use_clear_air_reference=use_clear_air_reference,
+        threshold_kgkg=threshold_kgkg,
+        rain_filename=rain_filename,
+    )
+
+    out = panel_plot(
+        results,
+        t_values,
+        outfile=outfile,
+        colormap=colormap,
+        arrow_subsample=arrow_subsample,
+        arrow_scale=arrow_scale,
+        subtract_mean_wind=False,
+    )
+    print(f"Saved: {out}")
+
+    if outfile_wind_anom is not None:
+        out2 = panel_plot(
+            results,
+            t_values,
+            outfile=outfile_wind_anom,
+            colormap=colormap,
+            arrow_subsample=arrow_subsample,
+            arrow_scale=arrow_scale,
+            subtract_mean_wind=True,
+        )
+        print(f"Saved: {out2}")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    p = argparse.ArgumentParser(description="Cold-pool panel plot from RICO LES outputs")
+    p.add_argument("--out", type=str, default="cold_pools_panels.png", help="Output PNG path")
+    p.add_argument("--out_anom", type=str, default=None, help="Optional PNG with mean-wind-subtracted arrows")
+    args = p.parse_args()
+
+    dr = os.environ.get("RICO_DATA")
+    if not dr or not os.path.isdir(dr):
+        raise SystemExit("set RICO_DATA to a valid data directory or use main.py")
+
+    main(data_root=dr, outfile=args.out, outfile_wind_anom=args.out_anom)

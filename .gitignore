@@ -1,0 +1,12 @@
+# figures
+*.png
+*.pdf
+
+# python artifacts
+__pycache__/
+*.pyc
+*.pyo
+.Python
+.pytest_cache/
+*.egg-info/
+
