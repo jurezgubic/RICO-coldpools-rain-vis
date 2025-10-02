@@ -100,3 +100,50 @@ def calculate_physics_variables(p_values, theta_l_values, q_l_values, q_t_values
     B = g * (theta_v - theta_v_mean) / theta_v_mean
 
     return T, rho, theta_v, B
+
+
+def theta_from_T_p(T: np.ndarray, p: np.ndarray) -> np.ndarray:
+    """Dry-air potential temperature from temperature and pressure.
+
+    theta = T * (p0/p)^(R_d/c_pd)
+    """
+    return np.asarray(T, dtype=float) * (p0 / np.asarray(p, dtype=float)) ** (r_d / c_pd)
+
+
+from typing import Union
+
+
+def density_potential_temperature(p_values,
+                                  T_values,
+                                  q_v_values,
+                                  q_l_values: Union[float, np.ndarray] = 0.0,
+                                  q_i_values: Union[float, np.ndarray] = 0.0,
+                                  q_r_values: Union[float, np.ndarray] = 0.0):
+    """Density potential temperature (Bryan 2008 style, no ice by default).
+
+    theta_rho = theta * (1 + (R_v/R_d) q_v - q_l - q_i) / (1 + q_t)
+
+    where theta = T * (p0/p)^(R_d/c_pd),
+    q_t = q_v + q_l + q_i, and all q are in kg/kg.
+    """
+    q_v = _ensure_kgkg(np.asarray(q_v_values, dtype=float))
+    q_l = _ensure_kgkg(np.asarray(q_l_values, dtype=float)) if q_l_values is not None else 0.0
+    q_i = _ensure_kgkg(np.asarray(q_i_values, dtype=float)) if q_i_values is not None else 0.0
+
+    q_r = _ensure_kgkg(np.asarray(q_r_values, dtype=float)) if q_r_values is not None else 0.0
+
+    theta = theta_from_T_p(T_values, p_values)
+    # include rain water in total mass loading
+    q_t = (
+        q_v
+        + (q_l if isinstance(q_l, np.ndarray) else q_l)
+        + (q_i if isinstance(q_i, np.ndarray) else q_i)
+        + (q_r if isinstance(q_r, np.ndarray) else q_r)
+    )
+    # subtract condensate (including rain) from virtual component multiplier
+    q_l_term = (q_l if isinstance(q_l, np.ndarray) else q_l)
+    q_i_term = (q_i if isinstance(q_i, np.ndarray) else q_i)
+    q_r_term = (q_r if isinstance(q_r, np.ndarray) else q_r)
+    factor = 1.0 + (r_v / r_d) * q_v - q_l_term - q_i_term - q_r_term
+    theta_rho = theta * factor / (1.0 + q_t)
+    return theta_rho

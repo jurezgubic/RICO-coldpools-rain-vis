@@ -11,6 +11,7 @@ from typing import Optional, Tuple
 import os
 
 from src.plot_cold_pools import main as run_panels
+from src.cold_pool_detect import run_detection, track_pools_over_time
 
 
 # config
@@ -54,6 +55,18 @@ config = {
     "gif_center_km": (0.0, 0.0),          # (x0_km, y0_km)
     "gif_half_window_km": (2.0, 2.0),     # (hx_km, hy_km)
     "gif_outfile": "cold_pools_tracking.gif",
+    
+    # detection and tracking options (default off)
+    "detect_pools": False,
+    "detect_minutes": 60,                # how many consecutive minutes to process
+    # rain seeding from rain-water mixing ratio
+    "qr_thresh_kgkg": 7.5e-5,                   # threshold on q_r (kg/kg)
+    "near_surface_levels": 1,                   # how many lowest levels to look at
+    "min_pool_area_km2": 8.0,                   # minimum rainy region area
+    "lag_minutes": 10,                          # thermodynamic lag after rain time
+    "hessian_sigma_m": 200.0,                   # Gaussian sigma in meters (~2-3*dx)
+    "use_advection_correction": False,          # advect centroids/polygons by mean wind
+    "detect_output_prefix": "pools",           # prefix for quick-look plots
 }
 
 
@@ -84,6 +97,34 @@ def main():
         gif_half_window_km=config["gif_half_window_km"],
         gif_outfile=config["gif_outfile"],
     )
+
+    # Optional: detect and track cold pools
+    if config.get("detect_pools", False):
+        pools_by_time = run_detection(
+            data_root=config["data_root"],
+            start_index=config["start_index"],
+            minutes=config["detect_minutes"],
+            z_index=config["z_index"],
+            qr_thresh_kgkg=config["qr_thresh_kgkg"],
+            near_surface_levels=config["near_surface_levels"],
+            min_area_km2=config["min_pool_area_km2"],
+            lag_minutes=config["lag_minutes"],
+            hessian_sigma_m=config["hessian_sigma_m"],
+            use_advection_correction=config["use_advection_correction"],
+            output_prefix=config["detect_output_prefix"],
+            make_plots=True,
+            colormap=config["colormap"],
+            arrow_subsample=config["arrow_subsample"],
+            arrow_scale=config["arrow_scale"],
+        )
+        tracks = track_pools_over_time(
+            pools_by_time,
+            data_root=config["data_root"],
+            z_index=config["z_index"],
+            use_advection_correction=config["use_advection_correction"],
+            min_overlap=0.5,
+        )
+        print(f"Detected tracks: {len(tracks)}")
 
 
 if __name__ == "__main__":

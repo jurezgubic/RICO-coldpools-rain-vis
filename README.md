@@ -14,6 +14,7 @@ Run
 Notes
 - If `rico.r.nc` is missing, rain is set to zero.
 - The second PNG uses wind anomalies (mean wind removed).
+- Cold-pool detection (optional in `main.py`) now seeds rainy regions from near-surface rain-water mixing ratio `q_r` (from `rico.r.nc`) using a threshold in kg/kg; centroids can be advected by mean low-level wind; boundaries come from the zero-contour of the radial second derivative of density potential temperature at a 10-minute lag.
 
 Sample gif (tracking mean winds)
 
