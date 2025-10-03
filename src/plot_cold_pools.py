@@ -309,6 +309,28 @@ def render_tracking_gif(
     """
     import imageio.v2 as imageio
 
+    # Helper: robustly convert a Matplotlib figure to an RGB image array across backends
+    def _fig_to_rgb(fig) -> np.ndarray:
+        fig.canvas.draw()
+        h, w = fig.canvas.get_width_height()[1], fig.canvas.get_width_height()[0]
+        # Try RGB first (Agg backends)
+        if hasattr(fig.canvas, "tostring_rgb"):
+            buf = fig.canvas.tostring_rgb()
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
+            return arr
+        # Fallback: ARGB (QtAgg)
+        if hasattr(fig.canvas, "tostring_argb"):
+            buf = fig.canvas.tostring_argb()
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)
+            # ARGB -> RGB (drop alpha, reorder)
+            return arr[:, :, 1:4]
+        # Last resort: buffer_rgba if available
+        if hasattr(fig.canvas, "buffer_rgba"):
+            buf = fig.canvas.buffer_rgba()
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)
+            return arr[:, :, :3]
+        raise RuntimeError("Unsupported Matplotlib canvas for GIF rendering.")
+
     # Load time axis
     t_values, ntime = _time_values_and_count(data_root)
     # Map minutes to indices by assuming 60 s per minute time axis spacing in seconds.
@@ -405,10 +427,8 @@ def render_tracking_gif(
         cbar = fig.colorbar(im, ax=ax, shrink=0.9, pad=0.02)
         cbar.set_label("theta_v (K)")
 
-        fig.canvas.draw()
-        # Convert figure to image array
-        fig_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-        fig_array = fig_array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+        # Convert figure to image array (backend-agnostic)
+        fig_array = _fig_to_rgb(fig)
         frames.append(fig_array)
         plt.close(fig)
 

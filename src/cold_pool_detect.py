@@ -7,6 +7,7 @@ import xarray as xr
 from scipy import ndimage
 from scipy.ndimage import binary_fill_holes
 from scipy.ndimage import gaussian_filter
+from scipy.ndimage import grey_closing, grey_opening
 from scipy.spatial import ConvexHull
 import matplotlib.pyplot as plt
 
@@ -100,21 +101,32 @@ def _rain_mask_from_qr(
     data_root: str,
     t_index: int,
     near_surface_levels: int,
-    qr_thresh_kgkg: float,
-    qr_max_height_m: Optional[float] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Binary rain mask from near-surface q_r threshold across levels.
+    qr_thresh_kgkg: Optional[float],
+    qr_max_height_m: Optional[float],
+    sigma_rain_smooth_m: float,
+    min_area_km2: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """Build rainy mask from q_r with smoothing, adaptive threshold, and diagnostics.
 
-    Returns (rainy_mask, xt, yt). If file is missing, returns all-False mask.
+    Returns (rainy_mask_post, xt, yt, diag)
+    diag includes: qr_field (smoothed), p95,p98,p99, qr_thresh, pre/post counts and areas, centroids_xy_km
     """
-    # base grid
+    # base grid and resolution
     with _open(os.path.join(data_root, "rico.p.nc")) as dsp:
         xt = np.array(dsp["xt"].values)
         yt = np.array(dsp["yt"].values)
+    dx = float(np.mean(np.diff(xt)))
+    dy = float(np.mean(np.diff(yt)))
+    km = 1000.0
     path = os.path.join(data_root, "rico.r.nc")
     if not os.path.exists(path):
         print("no rain mixing ratio file; treating q_r as zero")
-        return np.zeros((len(yt), len(xt)), dtype=bool), xt, yt
+        diag = {"qr_field": np.zeros((len(yt), len(xt)), dtype=float),
+                "p95": 0.0, "p98": 0.0, "p99": 0.0, "qr_thresh": float(qr_thresh_kgkg or 0.0),
+                "pre_components": 0, "pre_pixels": 0, "pre_area_km2": 0.0,
+                "post_components": 0, "post_pixels": 0, "post_area_km2": 0.0,
+                "centroids_xy_km": []}
+        return np.zeros((len(yt), len(xt)), dtype=bool), xt, yt, diag
     with _open(path) as ds:
         r_var = ds["r"]
         r_da = r_var.isel(time=t_index)
@@ -139,9 +151,70 @@ def _rain_mask_from_qr(
             r_sub = np.where(r_sub == float(miss), np.nan, r_sub)
         r_sub = np.where(r_sub < 0, 0.0, r_sub)
     qr = _ensure_kgkg(r_sub)
-    # rainy if any near-surface level exceeds threshold
-    rainy = np.nanmax(qr, axis=0) >= float(qr_thresh_kgkg)
-    return rainy, xt, yt
+    # max over selected levels
+    qr_max = np.nanmax(qr, axis=0)
+    # smooth with physical sigma
+    sigx = float(sigma_rain_smooth_m / dx) if dx > 0 else 1.0
+    sigy = float(sigma_rain_smooth_m / dy) if dy > 0 else 1.0
+    qr_smooth = gaussian_filter(qr_max, sigma=(sigy, sigx))
+    # small morphology close->open on greyscale field
+    footprint = np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=int)
+    qr_smooth = grey_closing(qr_smooth, footprint=footprint)
+    qr_smooth = grey_opening(qr_smooth, footprint=footprint)
+    # diagnostics percentiles
+    finite_vals = qr_smooth[np.isfinite(qr_smooth)]
+    if finite_vals.size == 0:
+        p95 = p98 = p99 = 0.0
+    else:
+        p95 = float(np.nanpercentile(finite_vals, 95))
+        p98 = float(np.nanpercentile(finite_vals, 98))
+        p99 = float(np.nanpercentile(finite_vals, 99))
+    # adaptive threshold unless explicit threshold provided
+    if qr_thresh_kgkg is None:
+        qr_thresh = max(min(p98, 5e-5), 2e-6)
+    else:
+        qr_thresh = float(qr_thresh_kgkg)
+    rainy0 = qr_smooth >= qr_thresh
+    # pre-filter counts
+    structure = np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=int)
+    labeled_pre, nlab_pre = ndimage.label(rainy0, structure=structure)
+    pre_pixels = int(rainy0.sum())
+    pre_area_km2 = pre_pixels * dx * dy / (km*km)
+    # fill holes per region and drop small areas
+    mask_keep = np.zeros_like(rainy0, dtype=bool)
+    for lab in range(1, nlab_pre+1):
+        region = (labeled_pre == lab)
+        region = binary_fill_holes(region)
+        area_km2 = region.sum() * dx * dy / (km*km)
+        if area_km2 >= float(min_area_km2):
+            mask_keep |= region
+    rainy = mask_keep
+    labeled_post, nlab_post = ndimage.label(rainy, structure=structure)
+    post_pixels = int(rainy.sum())
+    post_area_km2 = post_pixels * dx * dy / (km*km)
+    # centroids after filtering
+    cents: List[Tuple[float, float]] = []
+    for lab in range(1, nlab_post+1):
+        region = (labeled_post == lab)
+        if not np.any(region):
+            continue
+        iy, ix = np.nonzero(region)
+        if ix.size == 0:
+            continue
+        x0_km = float(np.mean(xt[ix]))/km
+        y0_km = float(np.mean(yt[iy]))/km
+        cents.append((x0_km, y0_km))
+
+    diag = {
+        "qr_field": qr_smooth,
+        "p95": p95, "p98": p98, "p99": p99,
+        "qr_thresh": float(qr_thresh),
+        "pre_components": int(nlab_pre), "pre_pixels": pre_pixels, "pre_area_km2": float(pre_area_km2),
+        "post_components": int(nlab_post), "post_pixels": post_pixels, "post_area_km2": float(post_area_km2),
+        "centroids_xy_km": cents,
+        "labeled_post": labeled_post,
+    }
+    return rainy, xt, yt, diag
 
 
 def _mask_from_polygon_contour(mask: np.ndarray) -> List[np.ndarray]:
@@ -222,6 +295,93 @@ def _zero_contour_paths_km(d2r: np.ndarray, xt_km: np.ndarray, yt_km: np.ndarray
     return paths
 
 
+def _plot_rain_distribution(
+    xt_km: np.ndarray,
+    yt_km: np.ndarray,
+    diag: dict,
+    prefix: str,
+    t_seed: int,
+):
+    """Diagnostic plot of smoothed qr_max with adaptive threshold and kept components."""
+    qr = diag.get("qr_field")
+    thresh = diag.get("qr_thresh", 0.0)
+    labeled_post = diag.get("labeled_post")
+    p95, p98, p99 = diag.get("p95", 0.0), diag.get("p98", 0.0), diag.get("p99", 0.0)
+    Xk, Yk = np.meshgrid(xt_km, yt_km)
+    fig, ax = plt.subplots(figsize=(6,6))
+    im = ax.pcolormesh(Xk, Yk, qr, shading="auto", cmap="viridis")
+    try:
+        cs = ax.contour(Xk, Yk, qr, levels=[thresh], colors="white", linewidths=1.0)
+    except Exception:
+        cs = None
+    # overlay labels/centroids
+    if labeled_post is not None:
+        comps = int(np.max(labeled_post)) if labeled_post.size > 0 else 0
+        for lab in range(1, comps+1):
+            mask = (labeled_post == lab)
+            if not np.any(mask):
+                continue
+            iy, ix = np.nonzero(mask)
+            cx = float(np.mean(xt_km[ix]))
+            cy = float(np.mean(yt_km[iy]))
+            ax.plot(cx, cy, marker="+", color="white", markersize=8, mew=1.5)
+    ax.set_title(f"qr_max smoothed @ t={t_seed}; p95={p95:.2e}, p98={p98:.2e}, p99={p99:.2e}; thr={thresh:.2e}")
+    ax.set_xlabel("x (km)")
+    ax.set_ylabel("y (km)")
+    cbar = fig.colorbar(im, ax=ax, shrink=0.9, pad=0.02)
+    cbar.set_label("q_r (kg/kg)")
+    out = f"{prefix}_rain_{int(t_seed):05d}.png"
+    fig.savefig(out, dpi=300)
+    plt.close(fig)
+
+
+def _plot_theta_rho_anom_with_candidates(
+    xt_km: np.ndarray,
+    yt_km: np.ndarray,
+    theta_rho: np.ndarray,
+    u_full: np.ndarray,
+    v_full: np.ndarray,
+    u_mean: float,
+    v_mean: float,
+    contour_paths: List[np.ndarray],
+    best_poly: Optional[Pool],
+    prefix: str,
+    t_lag_idx: int,
+    colormap: Optional[str],
+    arrow_subsample: int,
+    arrow_scale: float,
+):
+    """Plot theta_rho' with wind anomalies, all contours and highlight accepted polygon."""
+    X, Y = np.meshgrid(xt_km, yt_km)
+    theta_rho_pert = theta_rho - np.nanmean(theta_rho)
+    vmin = np.nanpercentile(theta_rho_pert, 5)
+    vmax = np.nanpercentile(theta_rho_pert, 95)
+    fig, ax = plt.subplots(figsize=(6,6))
+    im = ax.pcolormesh(X, Y, theta_rho_pert, shading="auto", cmap=(colormap or "viridis"), vmin=vmin, vmax=vmax)
+    step = max(1, int(arrow_subsample))
+    ax.quiver(X[::step, ::step], Y[::step, ::step], (u_full - u_mean)[::step, ::step], (v_full - v_mean)[::step, ::step],
+              color="black", scale=arrow_scale, width=0.002)
+    # all candidates
+    for seg in contour_paths:
+        ax.plot(seg[:,0], seg[:,1], color="white", linewidth=0.7, alpha=0.9)
+    title = f"theta_rho' and candidates at t_lag={t_lag_idx}"
+    # highlight accepted polygon
+    if best_poly is not None:
+        bx = best_poly.boundary_xy_km[:, 0]
+        by = best_poly.boundary_xy_km[:, 1]
+        ax.plot(bx, by, color="white", linewidth=2.0)
+    else:
+        title += " — NO_POLYGON_ACCEPTED"
+    ax.set_title(title)
+    ax.set_xlabel("x (km)")
+    ax.set_ylabel("y (km)")
+    cbar = fig.colorbar(im, ax=ax, shrink=0.9, pad=0.02)
+    cbar.set_label("theta_rho' (K)")
+    out = f"{prefix}_trho_{int(t_lag_idx):05d}.png"
+    fig.savefig(out, dpi=300)
+    plt.close(fig)
+
+
 @dataclass
 class Pool:
     time_index: int
@@ -238,13 +398,19 @@ def run_detection(
     start_index: int,
     minutes: int,
     z_index: int,
-    qr_thresh_kgkg: float = 7.5e-5,
+    qr_thresh_kgkg: Optional[float] = None,
     near_surface_levels: int = 1,
-    qr_max_height_m: Optional[float] = None,
-    min_area_km2: float = 8.0,
-    lag_minutes: int = 10,
-    hessian_sigma_m: float = 200.0,
-    use_advection_correction: bool = False,
+    qr_max_height_m: Optional[float] = 400.0,
+    min_area_km2: float = 0.2,
+    lag_minutes: int = 7,
+    hessian_sigma_m: float = 150.0,
+    sigma_rain_smooth_m: float = 150.0,
+    use_advection_correction: bool = True,
+    proximity_factor: float = 1.5,
+    cover_rainy_min: float = 0.60,
+    cover_poly_min: float = 0.10,
+    aspect_min: float = 0.40,
+    solidity_min: float = 0.55,
     output_prefix: Optional[str] = None,
     make_plots: bool = True,
     colormap: Optional[str] = None,
@@ -279,14 +445,27 @@ def run_detection(
         colormap = "cmo.thermal" if "cmo.thermal" in plt.colormaps() else ("cmocean.thermal" if "cmocean.thermal" in plt.colormaps() else "viridis")
 
     for t_seed in idx:
-        # 1) Rain seeding from q_r threshold at t_seed
-        rainy, xt_m, yt_m = _rain_mask_from_qr(
+        # 1) Rain seeding from q_r with smoothing + adaptive threshold at t_seed
+        rainy, xt_m, yt_m, diag = _rain_mask_from_qr(
             data_root=data_root,
             t_index=t_seed,
             near_surface_levels=near_surface_levels,
             qr_thresh_kgkg=qr_thresh_kgkg,
             qr_max_height_m=qr_max_height_m,
+            sigma_rain_smooth_m=sigma_rain_smooth_m,
+            min_area_km2=min_area_km2,
         )
+        # Seeding diagnostics
+        print(f"SEED t={t_seed}: pre comps={diag['pre_components']} pix={diag['pre_pixels']} area_km2={diag['pre_area_km2']:.3f}; "
+              f"post comps={diag['post_components']} pix={diag['post_pixels']} area_km2={diag['post_area_km2']:.3f}; "
+              f"qr_max p95/p98/p99={diag['p95']:.2e}/{diag['p98']:.2e}/{diag['p99']:.2e}; thresh={diag['qr_thresh']:.2e}")
+        if diag["post_components"] == 0:
+            print(f"SEEDING_EMPTY at t={t_seed}")
+        if make_plots and output_prefix:
+            try:
+                _plot_rain_distribution(xt_m/1000.0, yt_m/1000.0, diag, output_prefix, t_seed)
+            except Exception:
+                pass
         # four-connected components and fill holes per region
         structure = np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=int)
         labeled, nlab = ndimage.label(rainy, structure=structure)
@@ -411,8 +590,8 @@ def run_detection(
                 cy_poly_km = float(np.mean(yt_km[iy]))
                 cen_dist = np.hypot(cx_poly_km - cx_km, cy_poly_km - cy_km)
 
-                # Proximity test (within equivalent diameter of rainy region)
-                if cen_dist > rain_eq_diam_km:
+                # Proximity test (within proximity_factor × equivalent diameter of rainy region)
+                if cen_dist > (proximity_factor * rain_eq_diam_km):
                     continue
 
                 # Overlap tests (mask-based)
@@ -423,12 +602,12 @@ def run_detection(
                     continue
                 cover_rainy = inter / rain_px
                 cover_poly = inter / poly_px
-                if not (cover_rainy >= 0.90 and cover_poly >= 0.25):
+                if not (cover_rainy >= cover_rainy_min and cover_poly >= cover_poly_min):
                     continue
 
                 # Shape quality
                 props = _region_properties(poly_mask, dx, dy)
-                if not (props["aspect"] >= 0.7 and props["solidity"] >= 0.8):
+                if not (props["aspect"] >= aspect_min and props["solidity"] >= solidity_min):
                     continue
 
                 # Candidate passes; compute fields within polygon
@@ -459,30 +638,16 @@ def run_detection(
                 k = str(int(t_lag_idx))
                 results.setdefault(k, []).append(best_poly)
 
-        # Optional quick-look plot
-        if make_plots:
-            fig, ax = plt.subplots(figsize=(6,6))
-            X, Y = np.meshgrid(xt_km, yt_km)
-            vmin = np.nanpercentile(theta_rho_pert, 5)
-            vmax = np.nanpercentile(theta_rho_pert, 95)
-            im = ax.pcolormesh(X, Y, theta_rho_pert, shading="auto", cmap=colormap, vmin=vmin, vmax=vmax)
-            step = max(1, int(arrow_subsample))
-            ax.quiver(X[::step, ::step], Y[::step, ::step], (u_full - u_mean)[::step, ::step], (v_full - v_mean)[::step, ::step],
-                      color="black", scale=arrow_scale, width=0.002)
-            # draw boundaries
-            for pool in results.get(str(int(t_lag_idx)), []):
-                bx = pool.boundary_xy_km[:, 0]
-                by = pool.boundary_xy_km[:, 1]
-                ax.plot(bx, by, color="white", linewidth=1.5)
-            ax.set_title(f"theta_rho' and wind anom at timestep {t_lag_idx}")
-            ax.set_xlabel("x (km)")
-            ax.set_ylabel("y (km)")
-            cbar = fig.colorbar(im, ax=ax, shrink=0.9, pad=0.02)
-            cbar.set_label("theta_rho perturbation (K)")
-            if output_prefix:
-                out = f"{output_prefix}_trho_{int(t_lag_idx):05d}.png"
-                fig.savefig(out, dpi=300)
-            plt.close(fig)
+            # Diagnostic plot of theta_rho' and candidates
+            if make_plots and output_prefix:
+                try:
+                    _plot_theta_rho_anom_with_candidates(
+                        xt_km, yt_km, theta_rho, u_full, v_full, u_mean, v_mean,
+                        contour_paths, best_poly, output_prefix, t_lag_idx, colormap,
+                        arrow_subsample, arrow_scale,
+                    )
+                except Exception:
+                    pass
 
     return results
 
@@ -492,7 +657,8 @@ def track_pools_over_time(
     data_root: Optional[str] = None,
     z_index: int = 0,
     use_advection_correction: bool = False,
-    min_overlap: float = 0.5,
+    min_overlap: float = 0.30,
+    track_max_dist_factor: float = 2.0,
 ) -> List[Dict]:
     """Link pools between consecutive times by centroid distance and mutual overlap.
 
@@ -585,7 +751,7 @@ def track_pools_over_time(
                     if j in used:
                         continue
                     d = np.hypot(p.centroid_km[0] - p_prev.centroid_km[0], p.centroid_km[1] - p_prev.centroid_km[1])
-                    if d <= p_prev.eq_radius_km and d < best_d:
+                    if d <= (track_max_dist_factor * p_prev.eq_radius_km) and d < best_d:
                         m_curr = masks[j]
                         inter = (m_prev & m_curr).sum()
                         if inter == 0:

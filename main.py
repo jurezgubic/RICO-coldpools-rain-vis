@@ -56,18 +56,30 @@ config = {
     "gif_half_window_km": (2.0, 2.0),     # (hx_km, hy_km)
     "gif_outfile": "cold_pools_tracking.gif",
     
-    # detection and tracking options (default off)
-    "detect_pools": False,
+    # detection and tracking options
+    "detect_pools": True,
     "detect_minutes": 60,                # how many consecutive minutes to process
-    # rain seeding from rain-water mixing ratio
-    "qr_thresh_kgkg": 7.5e-5,                   # threshold on q_r (kg/kg)
-    "near_surface_levels": 1,                   # how many lowest levels to look at (used if qr_max_height_m is None)
-    "qr_max_height_m": None,                    # if set (e.g., 500), use max over z <= this height
-    "min_pool_area_km2": 8.0,                   # minimum rainy region area
-    "lag_minutes": 10,                          # thermodynamic lag after rain time
-    "hessian_sigma_m": 200.0,                   # Gaussian sigma in meters (~2-3*dx)
-    "use_advection_correction": False,          # advect centroids/polygons by mean wind
-    "detect_output_prefix": "pools",           # prefix for quick-look plots
+    # seeding from rain-water mixing ratio
+    "qr_thresh_kgkg": None,              # None -> adaptive threshold per minute
+    "near_surface_levels": 1,            # used if qr_max_height_m is None
+    "qr_max_height_m": 400.0,            # max over z <= this height (m)
+    "sigma_rain_smooth_m": 150.0,        # Gaussian smoothing for qr_max (m)
+    "min_pool_area_km2": 0.2,            # minimum rainy region area (km^2)
+    # lag and hessian
+    "lag_minutes": 7,
+    "hessian_sigma_m": 150.0,            # Gaussian sigma for Hessian (m)
+    "use_advection_correction": True,    # advect by mean low-level wind
+    # acceptance gates
+    "proximity_factor": 1.5,
+    "cover_rainy_min": 0.60,
+    "cover_poly_min": 0.10,
+    "aspect_min": 0.40,
+    "solidity_min": 0.55,
+    # tracking gates
+    "track_max_dist_factor": 2.0,        # × previous eq. radius
+    "track_min_overlap": 0.30,
+    # output
+    "detect_output_prefix": "pools",    # prefix for diagnostic plots
 }
 
 
@@ -112,7 +124,13 @@ def main():
             min_area_km2=config["min_pool_area_km2"],
             lag_minutes=config["lag_minutes"],
             hessian_sigma_m=config["hessian_sigma_m"],
+            sigma_rain_smooth_m=config["sigma_rain_smooth_m"],
             use_advection_correction=config["use_advection_correction"],
+            proximity_factor=config["proximity_factor"],
+            cover_rainy_min=config["cover_rainy_min"],
+            cover_poly_min=config["cover_poly_min"],
+            aspect_min=config["aspect_min"],
+            solidity_min=config["solidity_min"],
             output_prefix=config["detect_output_prefix"],
             make_plots=True,
             colormap=config["colormap"],
@@ -124,7 +142,8 @@ def main():
             data_root=config["data_root"],
             z_index=config["z_index"],
             use_advection_correction=config["use_advection_correction"],
-            min_overlap=0.5,
+            min_overlap=config["track_min_overlap"],
+            track_max_dist_factor=config["track_max_dist_factor"],
         )
         print(f"Detected tracks: {len(tracks)}")
 
