@@ -83,7 +83,14 @@ config = {
     # rain vs recognition GIF
     "make_rain_vs_recognition_gif": True,
     "rvrs_minutes": 60,
+    "rvrs_show_wind_arrows": False,     # hide arrows per your request
     "rvrs_outfile": "rain_vs_recognition.gif",
+    # zoom-follow GIF
+    "make_zoom_follow_gif": True,
+    "zfr_minutes": 60,
+    "zfr_outfile": "rain_zoom_follow.gif",
+    "zfr_window_factor": 3.0,
+    "zfr_min_half_window_km": 2.0,
 }
 
 
@@ -174,8 +181,36 @@ def main():
             arrow_scale=config["arrow_scale"],
             outfile=config["rvrs_outfile"],
             colormap=config["colormap"],
+            show_wind_arrows=config["rvrs_show_wind_arrows"],
         )
         print(f"Saved: {gif_path}")
+
+    if config.get("make_zoom_follow_gif", False):
+        from src.cold_pool_detect import render_zoom_follow_rain_gif
+        gif2 = render_zoom_follow_rain_gif(
+            data_root=config["data_root"],
+            start_index=config["start_index"],
+            minutes=config["zfr_minutes"],
+            z_index=config["z_index"],
+            qr_max_height_m=config["qr_max_height_m"],
+            sigma_rain_smooth_m=config["sigma_rain_smooth_m"],
+            min_area_km2=config["min_pool_area_km2"],
+            lag_minutes=config["lag_minutes"],
+            hessian_sigma_m=config["hessian_sigma_m"],
+            use_advection_correction=config["use_advection_correction"],
+            proximity_factor=config["proximity_factor"],
+            cover_rainy_min=config["cover_rainy_min"],
+            cover_poly_min=config["cover_poly_min"],
+            aspect_min=config["aspect_min"],
+            solidity_min=config["solidity_min"],
+            window_factor=config["zfr_window_factor"],
+            min_half_window_km=config["zfr_min_half_window_km"],
+            arrow_subsample=config["arrow_subsample"],
+            arrow_scale=config["arrow_scale"],
+            outfile=config["zfr_outfile"],
+            colormap=config["colormap"],
+        )
+        print(f"Saved: {gif2}")
 
 
 if __name__ == "__main__":
