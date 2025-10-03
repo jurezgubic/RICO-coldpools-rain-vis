@@ -101,6 +101,7 @@ def _rain_mask_from_qr(
     t_index: int,
     near_surface_levels: int,
     qr_thresh_kgkg: float,
+    qr_max_height_m: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Binary rain mask from near-surface q_r threshold across levels.
 
@@ -115,11 +116,28 @@ def _rain_mask_from_qr(
         print("no rain mixing ratio file; treating q_r as zero")
         return np.zeros((len(yt), len(xt)), dtype=bool), xt, yt
     with _open(path) as ds:
-        r_da = ds["r"].isel(time=t_index)
-        # select lowest levels; assume zt is ascending from surface
-        nz = int(ds.dims.get("zt", ds["r"].shape[0] if "zt" not in ds.dims else ds.sizes["zt"]))
-        nlev = max(1, min(int(near_surface_levels), nz))
-        r_sub = r_da.isel(zt=slice(0, nlev)).load().values.astype(float)
+        r_var = ds["r"]
+        r_da = r_var.isel(time=t_index)
+        # Choose vertical selection by height if provided, else by a fixed number of lowest levels
+        if qr_max_height_m is not None and "zt" in r_da.dims and "zt" in ds:
+            z = np.asarray(ds["zt"].values, dtype=float)
+            idx = np.where(z <= float(qr_max_height_m))[0]
+            if idx.size == 0:
+                idx = np.array([0])
+            r_da = r_da.isel(zt=idx)
+        else:
+            nz = int(ds.sizes.get("zt", r_da.sizes.get("zt", r_da.shape[0])))
+            nlev = max(1, min(int(near_surface_levels), nz))
+            r_da = r_da.isel(zt=slice(0, nlev))
+        r_sub = r_da.load().values.astype(float)
+        # mask fill/missing and clamp negatives
+        fill = r_var.attrs.get("_FillValue", None)
+        miss = r_var.attrs.get("missing_value", None)
+        if fill is not None:
+            r_sub = np.where(r_sub == float(fill), np.nan, r_sub)
+        if miss is not None:
+            r_sub = np.where(r_sub == float(miss), np.nan, r_sub)
+        r_sub = np.where(r_sub < 0, 0.0, r_sub)
     qr = _ensure_kgkg(r_sub)
     # rainy if any near-surface level exceeds threshold
     rainy = np.nanmax(qr, axis=0) >= float(qr_thresh_kgkg)
@@ -222,6 +240,7 @@ def run_detection(
     z_index: int,
     qr_thresh_kgkg: float = 7.5e-5,
     near_surface_levels: int = 1,
+    qr_max_height_m: Optional[float] = None,
     min_area_km2: float = 8.0,
     lag_minutes: int = 10,
     hessian_sigma_m: float = 200.0,
@@ -252,7 +271,8 @@ def run_detection(
     dy = float(np.mean(np.diff(yt)))
     km = 1000.0
 
-    results: Dict[str, List[Pool]] = {str(int(ti)): [] for ti in idx}
+    # Collect results keyed by lagged time index; create on demand
+    results: Dict[str, List[Pool]] = {}
 
     # determine default colormap
     if colormap is None:
@@ -265,6 +285,7 @@ def run_detection(
             t_index=t_seed,
             near_surface_levels=near_surface_levels,
             qr_thresh_kgkg=qr_thresh_kgkg,
+            qr_max_height_m=qr_max_height_m,
         )
         # four-connected components and fill holes per region
         structure = np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=int)
@@ -435,7 +456,8 @@ def run_detection(
                     best_centroid_dist = cen_dist
 
             if best_poly is not None:
-                results[str(int(t_lag_idx))].append(best_poly)
+                k = str(int(t_lag_idx))
+                results.setdefault(k, []).append(best_poly)
 
         # Optional quick-look plot
         if make_plots:
@@ -448,7 +470,7 @@ def run_detection(
             ax.quiver(X[::step, ::step], Y[::step, ::step], (u_full - u_mean)[::step, ::step], (v_full - v_mean)[::step, ::step],
                       color="black", scale=arrow_scale, width=0.002)
             # draw boundaries
-            for pool in results[str(int(t_lag_idx))]:
+            for pool in results.get(str(int(t_lag_idx)), []):
                 bx = pool.boundary_xy_km[:, 0]
                 by = pool.boundary_xy_km[:, 1]
                 ax.plot(bx, by, color="white", linewidth=1.5)

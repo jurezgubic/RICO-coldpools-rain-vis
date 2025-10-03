@@ -23,14 +23,14 @@ def _ensure_kgkg(q):
     # typical q_t in tropics is approx 10 g/kg -> 0.01 kg/kg
     # If values exceed 0.2, they are probably g/kg.
     max_abs = np.nanmax(np.abs(q))
-    # Print about units guess, but don't fail
-    try:
-        print(f"ensure_kgkg: max={float(max_abs):.4g} -> guessing {'g/kg' if max_abs > 0.2 else 'kg/kg'}")
-    except Exception:
-        pass
-    if max_abs is np.nan:
+    # Print only when conversion occurs; otherwise stay quiet
+    if not np.isfinite(max_abs):
         return q
     if max_abs > 0.2:
+        try:
+            print(f"ensure_kgkg: max={float(max_abs):.4g} -> converting g/kg to kg/kg")
+        except Exception:
+            pass
         return q / 1000.0
     return q
 

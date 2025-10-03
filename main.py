@@ -61,7 +61,8 @@ config = {
     "detect_minutes": 60,                # how many consecutive minutes to process
     # rain seeding from rain-water mixing ratio
     "qr_thresh_kgkg": 7.5e-5,                   # threshold on q_r (kg/kg)
-    "near_surface_levels": 1,                   # how many lowest levels to look at
+    "near_surface_levels": 1,                   # how many lowest levels to look at (used if qr_max_height_m is None)
+    "qr_max_height_m": None,                    # if set (e.g., 500), use max over z <= this height
     "min_pool_area_km2": 8.0,                   # minimum rainy region area
     "lag_minutes": 10,                          # thermodynamic lag after rain time
     "hessian_sigma_m": 200.0,                   # Gaussian sigma in meters (~2-3*dx)
@@ -107,6 +108,7 @@ def main():
             z_index=config["z_index"],
             qr_thresh_kgkg=config["qr_thresh_kgkg"],
             near_surface_levels=config["near_surface_levels"],
+            qr_max_height_m=config["qr_max_height_m"],
             min_area_km2=config["min_pool_area_km2"],
             lag_minutes=config["lag_minutes"],
             hessian_sigma_m=config["hessian_sigma_m"],
