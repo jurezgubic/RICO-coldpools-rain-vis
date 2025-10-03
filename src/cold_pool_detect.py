@@ -672,6 +672,7 @@ def render_zoom_follow_rain_gif(
     arrow_scale: float = 100,
     outfile: str = "rain_zoom_follow.gif",
     colormap: Optional[str] = None,
+    anchor_to_peak_in_window: bool = True,
 ):
     """Zoom onto the largest rainy blob and follow its centroid over time.
 
@@ -733,38 +734,43 @@ def render_zoom_follow_rain_gif(
         iy1 = max(iy0+1, min(iy1, len(yt_km)))
         return ix0, ix1, iy0, iy1
 
-    # find initial component to follow (largest area at start time)
-    rainy0, _xt, _yt, diag0 = _rain_mask_from_qr(
-        data_root=data_root,
-        t_index=idx[0],
-        near_surface_levels=1,
-        qr_thresh_kgkg=None,
-        qr_max_height_m=qr_max_height_m,
-        sigma_rain_smooth_m=sigma_rain_smooth_m,
-        min_area_km2=min_area_km2,
-    )
-    labeled0 = diag0.get("labeled_post")
-    if labeled0 is not None and labeled0.size > 0:
-        comps = int(np.max(labeled0))
-    else:
-        comps = 0
-    # pick centroid and equivalent radius of largest
-    follow_cx_km = float(np.mean(xt_km))
-    follow_cy_km = float(np.mean(yt_km))
-    eq_radius_km = 2.0
-    if comps > 0:
-        best_area = -1.0
+    # Pre-scan: find the rain component with the highest peak q_r in the requested window
+    best_peak = -np.inf
+    best_center = (float(np.mean(xt_km)), float(np.mean(yt_km)))
+    best_eqr = 2.0
+    for t_scan in idx:
+        _rainy, _xt, _yt, dscan = _rain_mask_from_qr(
+            data_root=data_root,
+            t_index=t_scan,
+            near_surface_levels=1,
+            qr_thresh_kgkg=None,
+            qr_max_height_m=qr_max_height_m,
+            sigma_rain_smooth_m=sigma_rain_smooth_m,
+            min_area_km2=min_area_km2,
+        )
+        labs = dscan.get("labeled_post")
+        qr_field = dscan.get("qr_field")
+        if labs is None or qr_field is None or labs.size == 0:
+            continue
+        comps = int(np.max(labs))
         for lab in range(1, comps+1):
-            reg = (labeled0 == lab)
+            reg = (labs == lab)
             if not np.any(reg):
                 continue
-            area_km2 = reg.sum() * dx * dy / (km*km)
-            if area_km2 > best_area:
+            peak = float(np.nanmax(qr_field[reg]))
+            if not np.isfinite(peak):
+                continue
+            if peak > best_peak:
                 iy, ix = np.nonzero(reg)
-                follow_cx_km = float(np.mean(xt_km[ix]))
-                follow_cy_km = float(np.mean(yt_km[iy]))
-                eq_radius_km = float(np.sqrt(area_km2/np.pi))
-                best_area = area_km2
+                cx = float(np.mean(xt_km[ix]))
+                cy = float(np.mean(yt_km[iy]))
+                area_km2 = reg.sum() * dx * dy / (km*km)
+                best_center = (cx, cy)
+                best_eqr = float(np.sqrt(area_km2/np.pi))
+                best_peak = peak
+
+    follow_cx_km, follow_cy_km = best_center
+    eq_radius_km = best_eqr
 
     hx_km = hy_km = max(min_half_window_km, window_factor * eq_radius_km)
 
@@ -962,6 +968,9 @@ def render_zoom_follow_rain_gif(
         step = max(1, int(arrow_subsample))
         axes[1].quiver(Xw[::step, ::step], Yw[::step, ::step], uw[::step, ::step], vw[::step, ::step],
                        color="black", scale=arrow_scale, width=0.002)
+        # also show rainy component boundaries in the right panel (to locate rain)
+        if labw is not None:
+            axes[1].contour(Xw, Yw, labw.astype(float), levels=[0.5], colors="white", linewidths=1.0, alpha=0.8)
         if accepted_poly is not None:
             seg = accepted_poly.boundary_xy_km
             # crop polygon lines to window by simple mask on points
