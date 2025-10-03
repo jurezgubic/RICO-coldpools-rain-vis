@@ -80,6 +80,10 @@ config = {
     "track_min_overlap": 0.30,
     # output
     "detect_output_prefix": "pools",    # prefix for diagnostic plots
+    # rain vs recognition GIF
+    "make_rain_vs_recognition_gif": True,
+    "rvrs_minutes": 60,
+    "rvrs_outfile": "rain_vs_recognition.gif",
 }
 
 
@@ -146,6 +150,32 @@ def main():
             track_max_dist_factor=config["track_max_dist_factor"],
         )
         print(f"Detected tracks: {len(tracks)}")
+
+    # Optional: side-by-side rain vs recognition GIF
+    if config.get("make_rain_vs_recognition_gif", False):
+        from src.cold_pool_detect import render_rain_vs_recognition_gif
+        gif_path = render_rain_vs_recognition_gif(
+            data_root=config["data_root"],
+            start_index=config["start_index"],
+            minutes=config["rvrs_minutes"],
+            z_index=config["z_index"],
+            qr_max_height_m=config["qr_max_height_m"],
+            sigma_rain_smooth_m=config["sigma_rain_smooth_m"],
+            min_area_km2=config["min_pool_area_km2"],
+            lag_minutes=config["lag_minutes"],
+            hessian_sigma_m=config["hessian_sigma_m"],
+            use_advection_correction=config["use_advection_correction"],
+            proximity_factor=config["proximity_factor"],
+            cover_rainy_min=config["cover_rainy_min"],
+            cover_poly_min=config["cover_poly_min"],
+            aspect_min=config["aspect_min"],
+            solidity_min=config["solidity_min"],
+            arrow_subsample=config["arrow_subsample"],
+            arrow_scale=config["arrow_scale"],
+            outfile=config["rvrs_outfile"],
+            colormap=config["colormap"],
+        )
+        print(f"Saved: {gif_path}")
 
 
 if __name__ == "__main__":

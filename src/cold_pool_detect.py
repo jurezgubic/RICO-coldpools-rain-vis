@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -11,7 +12,7 @@ from scipy.ndimage import grey_closing, grey_opening
 from scipy.spatial import ConvexHull
 import matplotlib.pyplot as plt
 
-from .physics import _ensure_kgkg, density_potential_temperature, g
+from .physics import _ensure_kgkg, density_potential_temperature, calculate_physics_variables, g
 
 
 def _open(path: str) -> xr.Dataset:
@@ -171,7 +172,8 @@ def _rain_mask_from_qr(
         p99 = float(np.nanpercentile(finite_vals, 99))
     # adaptive threshold unless explicit threshold provided
     if qr_thresh_kgkg is None:
-        qr_thresh = max(min(p98, 5e-5), 2e-6)
+        # Bare-minimum adaptive rule: floor only (very small), no upper cap
+        qr_thresh = max(p98, 5e-8)
     else:
         qr_thresh = float(qr_thresh_kgkg)
     rainy0 = qr_smooth >= qr_thresh
@@ -380,6 +382,270 @@ def _plot_theta_rho_anom_with_candidates(
     out = f"{prefix}_trho_{int(t_lag_idx):05d}.png"
     fig.savefig(out, dpi=300)
     plt.close(fig)
+
+
+def render_rain_vs_recognition_gif(
+    data_root: str,
+    start_index: int,
+    minutes: int,
+    z_index: int,
+    qr_max_height_m: float = 400.0,
+    sigma_rain_smooth_m: float = 150.0,
+    min_area_km2: float = 0.2,
+    lag_minutes: int = 7,
+    hessian_sigma_m: float = 150.0,
+    use_advection_correction: bool = True,
+    proximity_factor: float = 1.5,
+    cover_rainy_min: float = 0.60,
+    cover_poly_min: float = 0.10,
+    aspect_min: float = 0.40,
+    solidity_min: float = 0.55,
+    arrow_subsample: int = 8,
+    arrow_scale: float = 100,
+    outfile: str = "rain_vs_recognition.gif",
+    colormap: Optional[str] = None,
+):
+    """Write a two-panel GIF per frame: left rain seeding, right recognition.
+
+    This recomputes qr_max, adaptive threshold, candidates, and acceptance per frame.
+    """
+    import imageio.v2 as imageio
+
+    # backend-agnostic fig->RGB
+    def _fig_to_rgb(fig) -> np.ndarray:
+        fig.canvas.draw()
+        h, w = fig.canvas.get_width_height()[1], fig.canvas.get_width_height()[0]
+        if hasattr(fig.canvas, "tostring_rgb"):
+            buf = fig.canvas.tostring_rgb()
+            return np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
+        if hasattr(fig.canvas, "tostring_argb"):
+            buf = fig.canvas.tostring_argb()
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)
+            return arr[:, :, 1:4]
+        if hasattr(fig.canvas, "buffer_rgba"):
+            buf = fig.canvas.buffer_rgba()
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)
+            return arr[:, :, :3]
+        raise RuntimeError("Unsupported Matplotlib canvas")
+
+    # time index mapping
+    t_values, ntime = _time_values_and_count(data_root)
+    t0 = t_values[start_index]
+    target_times = t0 + 60.0 * np.arange(minutes)
+    idx = np.array([int(np.argmin(np.abs(t_values - tt))) for tt in target_times], dtype=int)
+    idx = idx[idx < ntime]
+
+    # grid and coords
+    with _open(os.path.join(data_root, "rico.p.nc")) as dsp:
+        xt_m = dsp["xt"].values
+        yt_m = dsp["yt"].values
+    xt_km = xt_m / 1000.0
+    yt_km = yt_m / 1000.0
+    Xk, Yk = np.meshgrid(xt_km, yt_km)
+
+    # choose default colormap once
+    if colormap is None:
+        colormap = "cmo.thermal" if "cmo.thermal" in plt.colormaps() else ("cmocean.thermal" if "cmocean.thermal" in plt.colormaps() else "viridis")
+
+    frames: List[np.ndarray] = []
+
+    # grid spacing for Hessian
+    dx = float(np.mean(np.diff(xt_m)))
+    dy = float(np.mean(np.diff(yt_m)))
+    sigma_x_pix = float(hessian_sigma_m / dx)
+    sigma_y_pix = float(hessian_sigma_m / dy)
+
+    for t_seed in idx:
+        # Left panel: qr_max smoothing + adaptive threshold + kept components
+        rainy, _xt, _yt, diag = _rain_mask_from_qr(
+            data_root=data_root,
+            t_index=t_seed,
+            near_surface_levels=1,
+            qr_thresh_kgkg=None,
+            qr_max_height_m=qr_max_height_m,
+            sigma_rain_smooth_m=sigma_rain_smooth_m,
+            min_area_km2=min_area_km2,
+        )
+
+        # Right panel ingredients at seed time
+        # Scalars for theta_v at the lowest level
+        with _open(os.path.join(data_root, "rico.p.nc")) as dsp:
+            p2d = dsp["p"].isel(time=t_seed, zt=z_index).load().values.astype(float)
+        with _open(os.path.join(data_root, "rico.t.nc")) as dst:
+            thl2d = dst["t"].isel(time=t_seed, zt=z_index).load().values.astype(float)
+        with _open(os.path.join(data_root, "rico.q.nc")) as dsq:
+            qt2d = dsq["q"].isel(time=t_seed, zt=z_index).load().values.astype(float)
+        with _open(os.path.join(data_root, "rico.l.nc")) as dsl:
+            ql2d = dsl["l"].isel(time=t_seed, zt=z_index).load().values.astype(float)
+        # optional rain
+        qr2d = None
+        r_path = os.path.join(data_root, "rico.r.nc")
+        if os.path.exists(r_path):
+            try:
+                with _open(r_path) as dsr:
+                    qr2d = dsr["r"].isel(time=t_seed, zt=z_index).load().values.astype(float)
+            except Exception:
+                qr2d = None
+        qt2d = _ensure_kgkg(qt2d)
+        ql2d = _ensure_kgkg(ql2d)
+        qr2d = _ensure_kgkg(qr2d) if qr2d is not None else 0.0
+        _, _, theta_v, _ = calculate_physics_variables(p2d, thl2d, ql2d, qt2d, qr2d)
+        # Winds and means
+        u_full, v_full, u_mean_s, v_mean_s = _winds_at_level_by_index(data_root, t_seed, z_index, xt_m, yt_m)
+
+        # Map to lag index and build recognition candidates
+        t_lag_target = t_values[t_seed] + lag_minutes * 60.0
+        t_lag_idx = int(np.argmin(np.abs(t_values - t_lag_target)))
+        accepted_poly: Optional[Pool] = None
+        contour_paths: List[np.ndarray] = []
+        if t_lag_idx < ntime:
+            theta_rho, _xtm, _ytm = _theta_rho_field(data_root, t_lag_idx, z_index)
+
+            # centroids at seed time (post-filter labels)
+            labeled_post = diag.get("labeled_post")
+            centroids_xy_km: List[Tuple[float, float]] = []
+            if labeled_post is not None:
+                comps = int(np.max(labeled_post)) if labeled_post.size > 0 else 0
+                for lab in range(1, comps+1):
+                    region = (labeled_post == lab)
+                    if not np.any(region):
+                        continue
+                    iy, ix = np.nonzero(region)
+                    if ix.size == 0:
+                        continue
+                    x0_km = float(np.mean(xt_km[ix]))
+                    y0_km = float(np.mean(yt_km[iy]))
+                    centroids_xy_km.append((x0_km, y0_km))
+            # advection of centroids
+            if use_advection_correction and len(centroids_xy_km) > 0:
+                dt_s = float((t_values[t_lag_idx] - t_values[t_seed]))
+                dx_km_adv = (u_mean_s * dt_s) / 1000.0
+                dy_km_adv = (v_mean_s * dt_s) / 1000.0
+                centroids_xy_km = [(cx + dx_km_adv, cy + dy_km_adv) for (cx, cy) in centroids_xy_km]
+
+            # Build rainy region mask for proximity/overlap gates
+            rainy_mask = (labeled_post > 0) if labeled_post is not None else np.zeros_like(theta_rho, dtype=bool)
+            # candidate contours and acceptance
+            structure = np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=int)
+            for cxy_km in centroids_xy_km:
+                d2r = _d2r_field(theta_rho, (cxy_km[0]*1000.0, cxy_km[1]*1000.0), xt_m, yt_m, (sigma_y_pix, sigma_x_pix))
+                segs = _zero_contour_paths_km(d2r, xt_km, yt_km)
+                contour_paths.extend(segs)
+                if len(segs) == 0:
+                    continue
+                # choose rainy component closest to centroid
+                labeled_rain, nlab_rain = ndimage.label(rainy_mask, structure=structure)
+                if nlab_rain == 0:
+                    continue
+                # compute rain eq diameter
+                dists = []
+                for lab in range(1, nlab_rain+1):
+                    reg = (labeled_rain == lab)
+                    iy, ix = np.nonzero(reg)
+                    if ix.size == 0:
+                        continue
+                    x_km = float(np.mean(xt_km[ix]))
+                    y_km = float(np.mean(yt_km[iy]))
+                    dists.append(((cxy_km[0]-x_km)**2 + (cxy_km[1]-y_km)**2, lab))
+                if not dists:
+                    continue
+                dists.sort()
+                rain_lab = dists[0][1]
+                rain_mask = (labeled_rain == rain_lab)
+                area_km2 = rain_mask.sum() * dx * dy / (1000.0*1000.0)
+                rain_eq_diam_km = 2.0 * np.sqrt(area_km2 / np.pi)
+
+                # Evaluate candidates
+                Xg, Yg = Xk, Yk
+                from matplotlib.path import Path as MplPath
+                best: Optional[Pool] = None
+                best_d = np.inf
+                for seg in segs:
+                    path = MplPath(seg)
+                    inside = path.contains_points(np.column_stack([Xg.ravel(), Yg.ravel()]))
+                    poly_mask = inside.reshape(Xg.shape)
+                    if poly_mask.sum() == 0:
+                        continue
+                    # centroid
+                    iy, ix = np.nonzero(poly_mask)
+                    cx_poly_km = float(np.mean(xt_km[ix]))
+                    cy_poly_km = float(np.mean(yt_km[iy]))
+                    dcen = np.hypot(cx_poly_km - cxy_km[0], cy_poly_km - cxy_km[1])
+                    if dcen > (proximity_factor * rain_eq_diam_km):
+                        continue
+                    inter = (poly_mask & rain_mask).sum()
+                    if inter == 0:
+                        continue
+                    cover_rainy = inter / rain_mask.sum()
+                    cover_poly = inter / poly_mask.sum()
+                    if not (cover_rainy >= cover_rainy_min and cover_poly >= cover_poly_min):
+                        continue
+                    props = _region_properties(poly_mask, dx, dy)
+                    if not (props["aspect"] >= aspect_min and props["solidity"] >= solidity_min):
+                        continue
+                    theta_vals = theta_rho[poly_mask]
+                    area_km2_poly = props["area"] / (1000.0*1000.0)
+                    eq_radius_km = props["eq_radius"] / 1000.0
+                    pool = Pool(
+                        time_index=int(t_lag_idx),
+                        centroid_km=(cx_poly_km, cy_poly_km),
+                        area_km2=float(area_km2_poly),
+                        eq_radius_km=float(eq_radius_km),
+                        mean_theta_rho=float(np.nanmean(theta_vals)),
+                        min_theta_rho=float(np.nanmin(theta_vals)),
+                        boundary_xy_km=seg,
+                    )
+                    if dcen < best_d:
+                        best = pool
+                        best_d = dcen
+                if best is not None and accepted_poly is None:
+                    accepted_poly = best
+
+        # Build the frame with two panels
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5), constrained_layout=True)
+        # Left: rain
+        im0 = axes[0].pcolormesh(Xk, Yk, diag.get("qr_field"), shading="auto", cmap="viridis")
+        try:
+            axes[0].contour(Xk, Yk, diag.get("qr_field"), levels=[diag.get("qr_thresh", 0.0)], colors="white", linewidths=1.0)
+        except Exception:
+            pass
+        # overlay outline of kept rainy components
+        labeled_post = diag.get("labeled_post")
+        if labeled_post is not None:
+            axes[0].contour(Xk, Yk, labeled_post.astype(float), levels=[0.5], colors="white", linewidths=1.5)
+        axes[0].set_title("rain mixing ratio (max z≤400 m)")
+        cbar0 = fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.02)
+        cbar0.set_label("q_r (kg kg$^{-1}$)")
+        # small text box with percentiles and threshold
+        p95, p98, p99, thr = diag.get("p95", 0.0), diag.get("p98", 0.0), diag.get("p99", 0.0), diag.get("qr_thresh", 0.0)
+        axes[0].text(0.02, 0.98, f"p95={p95:.1e}\np98={p98:.1e}\np99={p99:.1e}\nthr={thr:.1e}",
+                     transform=axes[0].transAxes, va='top', ha='left', color='white', fontsize=8,
+                     bbox=dict(facecolor='black', alpha=0.4, pad=4, edgecolor='none'))
+
+        # Right: recognition on theta_v with wind anomalies; overlay candidates/accepted at lag
+        vmin = float(np.nanpercentile(theta_v, 5))
+        vmax = float(np.nanpercentile(theta_v, 95))
+        im1 = axes[1].pcolormesh(Xk, Yk, theta_v, shading="auto", cmap=colormap, vmin=vmin, vmax=vmax)
+        step = max(1, int(arrow_subsample))
+        axes[1].quiver(Xk[::step, ::step], Yk[::step, ::step], (u_full - u_mean_s)[::step, ::step], (v_full - v_mean_s)[::step, ::step],
+                       color="black", scale=arrow_scale, width=0.002)
+        if accepted_poly is not None:
+            axes[1].plot(accepted_poly.boundary_xy_km[:,0], accepted_poly.boundary_xy_km[:,1], color='white', linewidth=2.0)
+        else:
+            for seg in contour_paths:
+                axes[1].plot(seg[:,0], seg[:,1], color='white', linewidth=0.8)
+        axes[1].set_title("θ_v and wind anomalies")
+        cbar1 = fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.02)
+        cbar1.set_label("θ_v (K)")
+
+        # capture frame
+        frame = _fig_to_rgb(fig)
+        frames.append(frame)
+        plt.close(fig)
+
+    # write GIF (~5 fps)
+    imageio.mimsave(outfile, frames, duration=0.2)
+    return outfile
 
 
 @dataclass
