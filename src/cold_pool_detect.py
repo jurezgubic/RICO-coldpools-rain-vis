@@ -27,7 +27,7 @@ def _time_values_and_count(data_root: str) -> Tuple[np.ndarray, int]:
 
 def _winds_at_level_by_index(data_root: str, t_index: int, z_index: int,
                              xt: np.ndarray, yt: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float, float]:
-    # Read u and v, interpolate to centers using xarray built-in interp like in plot module
+    # interpolate u,v to cell centers so arrows/fields align
     with _open(os.path.join(data_root, "rico.u.nc")) as dsu:
         u_da = dsu["u"].isel(time=t_index, zt=z_index)
         if "xm" in u_da.dims:
@@ -81,11 +81,7 @@ def _theta_rho_field(data_root: str, t_index: int, z_index: int) -> Tuple[np.nda
     # derive qv = qt - ql - qr
     qv2d = np.clip(qt2d - ql2d - (qr2d if isinstance(qr2d, np.ndarray) else qr2d), 0.0, None)
 
-    # We need temperature T; use existing physics conversion by reconstructing from theta_l
-    # Quick consistent T reconstruction as used in physics.calculate_physics_variables
-    # Reuse that code indirectly: approximate T via theta_l and p with moist kappa factor
-    # For density potential temperature we only need theta = T (p0/p)^(R_d/c_pd),
-    # but T below follows the same approach as calculate_physics_variables.
+    # reconstruct T from theta_l and p using the same moist kappa used elsewhere
     from .physics import r_d, c_pd, l_v, p0, r_v, c_pv
 
     theta_l = thl2d
@@ -107,11 +103,7 @@ def _rain_mask_from_qr(
     sigma_rain_smooth_m: float,
     min_area_km2: float,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
-    """Build rainy mask from q_r with smoothing, adaptive threshold, and diagnostics.
-
-    Returns (rainy_mask_post, xt, yt, diag)
-    diag includes: qr_field (smoothed), p95,p98,p99, qr_thresh, pre/post counts and areas, centroids_xy_km
-    """
+    """Build rainy mask from q_r with smoothing + adaptive threshold."""
     # base grid and resolution
     with _open(os.path.join(data_root, "rico.p.nc")) as dsp:
         xt = np.array(dsp["xt"].values)
@@ -131,7 +123,7 @@ def _rain_mask_from_qr(
     with _open(path) as ds:
         r_var = ds["r"]
         r_da = r_var.isel(time=t_index)
-        # Choose vertical selection by height if provided, else by a fixed number of lowest levels
+        # select levels by height when given; else use the first N levels
         if qr_max_height_m is not None and "zt" in r_da.dims and "zt" in ds:
             z = np.asarray(ds["zt"].values, dtype=float)
             idx = np.where(z <= float(qr_max_height_m))[0]
@@ -220,7 +212,7 @@ def _rain_mask_from_qr(
 
 
 def _mask_from_polygon_contour(mask: np.ndarray) -> List[np.ndarray]:
-    """Extract polygon boundaries from a binary mask using matplotlib contours."""
+    """Get polygon boundaries from a binary mask via a contour."""
     cs = plt.contour(mask.astype(float), levels=[0.5])
     paths = []
     for c in cs.allsegs[0]:
@@ -259,10 +251,7 @@ def _d2r_field(
     yt_m: np.ndarray,
     sigma_pix_yx: Tuple[float, float],
 ) -> np.ndarray:
-    """Second radial derivative field u^T H u about centroid, smoothed with anisotropic sigma in pixel units.
-
-    sigma_pix_yx is (sigma_y_pixels, sigma_x_pixels) corresponding to array axes (yt, xt).
-    """
+    """Second radial derivative u^T H u about the centroid; Gaussian smoothing uses pixel sigmas (y,x)."""
     sy, sx = sigma_pix_yx
     # Hessian components (orders along (y, x))
     dxx = gaussian_filter(theta_rho, sigma=(sy, sx), order=(0, 2))
@@ -280,7 +269,7 @@ def _d2r_field(
 
 
 def _zero_contour_paths_km(d2r: np.ndarray, xt_km: np.ndarray, yt_km: np.ndarray) -> List[np.ndarray]:
-    """Return closed zero-level contour paths of d2r in km coordinates (list of Nx2 arrays)."""
+    """Closed zero-contour paths of d2r in km coords (list of Nx2)."""
     Xk, Yk = np.meshgrid(xt_km, yt_km)
     cs = plt.contour(Xk, Yk, d2r, levels=[0.0])
     paths: List[np.ndarray] = []
@@ -304,7 +293,7 @@ def _plot_rain_distribution(
     prefix: str,
     t_seed: int,
 ):
-    """Diagnostic plot of smoothed qr_max with adaptive threshold and kept components."""
+    """Smoothed qr_max with adaptive threshold and kept components (quick check)."""
     qr = diag.get("qr_field")
     thresh = diag.get("qr_thresh", 0.0)
     labeled_post = diag.get("labeled_post")
@@ -353,7 +342,7 @@ def _plot_theta_rho_anom_with_candidates(
     arrow_subsample: int,
     arrow_scale: float,
 ):
-    """Plot theta_rho' with wind anomalies, all contours and highlight accepted polygon."""
+    """theta_rho' + wind anomalies; draw all contours and highlight the accepted polygon."""
     X, Y = np.meshgrid(xt_km, yt_km)
     theta_rho_pert = theta_rho - np.nanmean(theta_rho)
     vmin = np.nanpercentile(theta_rho_pert, 5)
@@ -406,10 +395,7 @@ def render_rain_vs_recognition_gif(
     colormap: Optional[str] = None,
     show_wind_arrows: bool = True,
 ):
-    """Write a two-panel GIF per frame: left rain seeding, right recognition.
-
-    This recomputes qr_max, adaptive threshold, candidates, and acceptance per frame.
-    """
+    """Two-panel GIF per frame (rain vs recognition); recompute everything frame-by-frame."""
     import imageio.v2 as imageio
 
     # backend-agnostic fig->RGB
@@ -1028,10 +1014,8 @@ def run_detection(
     arrow_subsample: int = 8,
     arrow_scale: float = 100,
 ) -> Dict[str, List[Pool]]:
-    """Detect cold pools per the provided procedure and return pools per time.
-
-    This function operates time-by-time; tracking is returned by a separate helper.
-    """
+    """End-to-end detection; return pools keyed by lagged timestep.
+    (Tracking is a separate helper.)"""
     t_values, ntime = _time_values_and_count(data_root)
     # minute-by-minute indices based on time axis (seconds)
     t_values, ntime = _time_values_and_count(data_root)
@@ -1271,11 +1255,9 @@ def track_pools_over_time(
     min_overlap: float = 0.30,
     track_max_dist_factor: float = 2.0,
 ) -> List[Dict]:
-    """Link pools between consecutive times by centroid distance and mutual overlap.
-
-    Optionally advect previous polygons by domain-mean low-level wind before overlap.
-    Uses native grid for rasterization if data_root is provided; otherwise infers a coarse grid.
-    """
+    """Link pools between times using centroid distance + overlap.
+    I can advect previous polygons by mean wind before overlap.
+    Rasterize on native grid when I have it; otherwise fall back to a coarse grid."""
     # time keys as sorted integers
     times = sorted([int(k) for k in pools_by_time.keys()])
     tracks: List[Dict] = []

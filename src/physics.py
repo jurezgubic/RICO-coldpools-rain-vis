@@ -1,7 +1,7 @@
 import numpy as np
 
 
-# physical constants (lowercase by preference)
+# constants I keep lowercase
 r_d = 287.04       # gas constant dry air [J/kg/K]
 r_v = 461.5        # gas constant water vapor [J/kg/K]
 c_pd = 1005.0      # specific heat dry air at constant pressure [J/kg/K]
@@ -14,9 +14,8 @@ g = 9.80665        # gravity [m/s^2]
 
 
 def _ensure_kgkg(q):
-    """Convert mixing ratio that may be provided in g/kg to kg/kg.
-
-    quick check: print max and guess units, then convert if needed.
+    """Keep everything in kg/kg; if values look like g/kg, convert.
+    Only print when I actually convert.
     """
     if q is None:
         return None
@@ -37,32 +36,8 @@ def _ensure_kgkg(q):
 
 def calculate_physics_variables(p_values, theta_l_values, q_l_values, q_t_values,
                                 q_r_values=None):
-    """Vectorized temperature, density, and theta_v from theta_l.
-
-    Parameters
-    ----------
-    p_values : ndarray
-        Pressure [Pa]
-    theta_l_values : ndarray
-        Liquid water potential temperature [K]
-    q_l_values : ndarray
-        Cloud liquid water mixing ratio [kg/kg] or [g/kg]
-    q_t_values : ndarray
-        Total (non-precipitating) water mixing ratio [kg/kg] or [g/kg].
-        In many LES setups this is q_v + q_l.
-    q_r_values : ndarray, optional
-        Rain water mixing ratio [kg/kg] or [g/kg]. If not provided, assumed 0.
-
-    Returns
-    -------
-    T : ndarray
-        Temperature [K]
-    rho : ndarray
-        Air density [kg/m^3]
-    theta_v : ndarray
-        Virtual potential temperature [K]
-    B : ndarray
-        Buoyancy relative to planar mean [m/s^2]
+    """Compute T, rho, theta_v, and B from theta_l/p and water species.
+    q_r is optional (defaults to 0).
     """
 
     # Convert g/kg -> kg/kg if needed
@@ -76,16 +51,16 @@ def calculate_physics_variables(p_values, theta_l_values, q_l_values, q_t_values
     p = np.asarray(p_values, dtype=float)
     theta_l = np.asarray(theta_l_values, dtype=float)
 
-    # moist-adjusted kappa (same as cloudtracker physics)
+    # moist-adjusted kappa
     kappa = (r_d / c_pd) * ((1.0 + q_v / epsilon) / (1.0 + q_v * (c_pv / c_pd)))
 
-    # temperature from theta_l and p (same as cloudtracker physics)
+    # temperature from theta_l and p
     T = theta_l * (c_pd / (c_pd - l_v * q_l)) * (p0 / p) ** (-kappa)
 
-    # partial pressure of vapor from mixing ratio (same as cloudtracker physics)
+    # partial pressure of vapor from mixing ratio
     p_v = (q_v / (q_v + epsilon)) * p
 
-    # density: dry air + vapor + suspended liquid + rain (same as cloudtracker physics)
+    # density: dry air + vapor; then add condensate mass explicitly
     rho = (p - p_v) / (r_d * T) + (p_v / (r_v * T))
     # add condensate mass explicitly (liquid + rain) with bulk density of water
     rho = rho + (q_l + (q_r if isinstance(q_r, np.ndarray) else q_r)) * rho_l
@@ -95,7 +70,7 @@ def calculate_physics_variables(p_values, theta_l_values, q_l_values, q_t_values
     T_v = T * (1.0 + 0.61 * q_v - q_l - q_r_term)
     theta_v = T_v * (p0 / p) ** (r_d / c_pd)
 
-    # buoyancy about planar mean theta_v (B = g * theta_v'/theta_v_mean)
+    # buoyancy relative to planar-mean theta_v
     theta_v_mean = np.nanmean(theta_v)
     B = g * (theta_v - theta_v_mean) / theta_v_mean
 
@@ -103,10 +78,7 @@ def calculate_physics_variables(p_values, theta_l_values, q_l_values, q_t_values
 
 
 def theta_from_T_p(T: np.ndarray, p: np.ndarray) -> np.ndarray:
-    """Dry-air potential temperature from temperature and pressure.
-
-    theta = T * (p0/p)^(R_d/c_pd)
-    """
+    """Dry potential temperature from T and p (theta = T * (p0/p)^(R_d/c_pd))."""
     return np.asarray(T, dtype=float) * (p0 / np.asarray(p, dtype=float)) ** (r_d / c_pd)
 
 
@@ -119,13 +91,15 @@ def density_potential_temperature(p_values,
                                   q_l_values: Union[float, np.ndarray] = 0.0,
                                   q_i_values: Union[float, np.ndarray] = 0.0,
                                   q_r_values: Union[float, np.ndarray] = 0.0):
-    """Density potential temperature (Bryan 2008 style, no ice by default).
-
+    """Include rain in both mass loading and condensate term.
+    
     theta_rho = theta * (1 + (R_v/R_d) q_v - q_l - q_i) / (1 + q_t)
-
+    
     where theta = T * (p0/p)^(R_d/c_pd),
+    
     q_t = q_v + q_l + q_i, and all q are in kg/kg.
     """
+    
     q_v = _ensure_kgkg(np.asarray(q_v_values, dtype=float))
     q_l = _ensure_kgkg(np.asarray(q_l_values, dtype=float)) if q_l_values is not None else 0.0
     q_i = _ensure_kgkg(np.asarray(q_i_values, dtype=float)) if q_i_values is not None else 0.0

@@ -1,10 +1,6 @@
-"""Run cold-pool panel plotting with a simple config.
+"""Quick runner with a config I tweak locally.
 
-Edit the config dict below and run:
-
-    python main.py
-
-This produces two PDFs: one with actual winds, and one with mean-wind-subtracted winds.
+Usage stays the same: python main.py
 """
 
 from typing import Optional, Tuple
@@ -16,26 +12,25 @@ from src.cold_pool_detect import run_detection, track_pools_over_time
 
 # config
 config = {
-    # where the RICO files live
-    "data_root": os.environ.get("RICO_DATA", "/Users/jure/PhD/coding/RICO_1hr"),
+    "data_root": os.environ.get("RICO_DATA", "/Users/jure/PhD/coding/RICO_1hr"),  # where my data lives
 
     # vertical level index
     "z_index": 2,
 
-    # time index of the first panel and the time in indices between panels
+    # first time index and stride for static panels
     "start_index": 0,
     "time_stride": 1,
     "n_panels": 3, 
 
-    # buoyancy reference; if True use clear air (ql + qr < threshold), else domain mean
+    # buoyancy reference (clear air vs domain mean)
     "use_clear_air_reference": True,
-    # threshold in kg/kg (default is 0.00005 kg/kg)
+    # clear‑air threshold (kg/kg)
     "threshold_kgkg": 1e-5,
 
-    # rain file name; warn and assume zero if missing
+    # rain file name; assume zero if missing
     "rain_filename": "rico.r.nc",
 
-    # optional zoom in k (-X,+X). None for full domain
+    # optional static zoom in km; None -> full domain
     "xlim_km": (-2,2),
     "ylim_km": (-2,2),
 
@@ -48,15 +43,15 @@ config = {
     "outfile": "cold_pools_panels.png",
     "outfile_wind_anom": "cold_pools_panels_anom.png",
     
-    # gif options
-    "make_tracking_gif": True,           # single-panel, minute-by-minute GIF
-    "gif_minutes": 20,                    # number of frames (minutes)
-    # region center and half-window in km in domain coords
-    "gif_center_km": (0.0, 0.0),          # (x0_km, y0_km)
-    "gif_half_window_km": (2.0, 2.0),     # (hx_km, hy_km)
+    # simple tracking GIF (fixed window advected by mean wind)
+    "make_tracking_gif": True,
+    "gif_minutes": 20,
+    # region center and half-window in km (domain coords)
+    "gif_center_km": (0.0, 0.0),
+    "gif_half_window_km": (2.0, 2.0),
     "gif_outfile": "cold_pools_tracking.gif",
     
-    # detection and tracking options
+    # detection + tracking
     "detect_pools": True,
     "detect_minutes": 60,                # how many consecutive minutes to process
     # seeding from rain-water mixing ratio
@@ -83,7 +78,7 @@ config = {
     # rain vs recognition GIF
     "make_rain_vs_recognition_gif": True,
     "rvrs_minutes": 60,
-    "rvrs_show_wind_arrows": False,     # hide arrows per your request
+    "rvrs_show_wind_arrows": False,     # hide arrows, otherwise too cluttered
     "rvrs_outfile": "rain_vs_recognition.gif",
     # zoom-follow GIF
     "make_zoom_follow_gif": True,

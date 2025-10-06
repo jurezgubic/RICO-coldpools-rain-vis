@@ -9,7 +9,7 @@ from .physics import calculate_physics_variables, _ensure_kgkg, g
 
 
 def _open(path: str) -> xr.Dataset:
-    # Keep numeric time axis in seconds; we only need relative minutes.
+    # keep numeric time axis in seconds; I only need relative minutes
     return xr.open_dataset(path, decode_times=False)
 
 
@@ -23,10 +23,7 @@ def _load_time_coord(ds: xr.Dataset) -> np.ndarray:
 
 
 def _time_values_and_count(data_root: str) -> Tuple[np.ndarray, int]:
-    """Return raw time values and count from a base file.
-
-    We assume all files share the same time axis length (per user instruction).
-    """
+    """Raw time values and count from a base file."""
     with _open(os.path.join(data_root, "rico.p.nc")) as ds:
         t = ds["time"].values
     return t, int(t.shape[0])
@@ -34,7 +31,7 @@ def _time_values_and_count(data_root: str) -> Tuple[np.ndarray, int]:
 
 def _get2d_by_index(ds_path: str, var: str, t_index: int, z_index: int,
                     x_name: str = "xt", y_name: str = "yt") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load a single (yt, xt) 2D slice at given time index and z index."""
+    """Single (yt, xt) 2D slice at time/z index."""
     with _open(ds_path) as ds:
         da = ds[var].isel(time=t_index, zt=z_index)
         x = np.array(ds[x_name].values)
@@ -48,12 +45,7 @@ def _get2d_by_index(ds_path: str, var: str, t_index: int, z_index: int,
 
 
 def _interp_to_center(u_da: xr.DataArray, xt: np.ndarray = None, yt: np.ndarray = None) -> xr.DataArray:
-    """Interpolate staggered winds to cell centers.
-
-    u has dims (.., yt, xm) so it is staggered in x; v has dims (.., ym, xt)
-    so it is staggered in y. Scalars (p, t, q*, θv) are at (.., yt, xt).
-    We bring winds onto centers so arrows line up with scalars.
-    """
+    """Interpolate staggered winds to centers so arrows line up with scalars."""
     kwargs = {}
     if xt is not None and "xm" in u_da.dims:
         kwargs["xm"] = xt
@@ -66,7 +58,7 @@ def _interp_to_center(u_da: xr.DataArray, xt: np.ndarray = None, yt: np.ndarray 
 
 def _winds_at_level_by_index(data_root: str, t_index: int, z_index: int,
                              xt: np.ndarray, yt: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Return u,v on (yt, xt) at time index and z index."""
+    """u,v on (yt, xt) at time/z index."""
     # u: dims (time, zt, yt, xm)
     with _open(os.path.join(data_root, "rico.u.nc")) as dsu:
         u_da = dsu["u"].isel(time=t_index, zt=z_index)
@@ -102,10 +94,8 @@ def compute_fields_for_indices(
     threshold_kgkg: float = 5e-5,
     rain_filename: str = "rico.r.nc",
 ) -> List[dict]:
-    """Compute theta_v, density, winds and buoyancy for given time indices at level index.
-
-    Returns list of dicts for each time index with fields and coordinates. Applies
-    optional spatial cropping to the same subdomain for all fields.
+    """theta_v, density, winds, buoyancy for a set of time indices at one level.
+    I can crop to the same subdomain across fields.
     """
     # Grid from pressure file
     with _open(os.path.join(data_root, "rico.p.nc")) as dsp:
@@ -216,7 +206,7 @@ def panel_plot(
     ncols = 3 if n >= 3 else n
     nrows = int(np.ceil(n / ncols))
 
-    # Global color limits for consistent shading
+    # color limits shared across panels
     all_thv = np.concatenate([np.ravel(r["theta_v"]) for r in results])
     vmin = np.nanpercentile(all_thv, 2)
     vmax = np.nanpercentile(all_thv, 98)
@@ -225,7 +215,7 @@ def panel_plot(
     if colormap is None:
         colormap = "cmo.thermal" if "cmo.thermal" in plt.colormaps() else ("cmocean.thermal" if "cmocean.thermal" in plt.colormaps() else "viridis")
 
-    # arrow sub-sampling for readability
+    # thin the arrow field for readability
     def subsample(arr, step=arrow_subsample):
         return arr[::step, ::step]
 
@@ -301,12 +291,8 @@ def render_tracking_gif(
     arrow_subsample: int = 8,
     arrow_scale: float = 100,
 ):
-    """Render a GIF following a fixed-size window advected by domain-mean wind.
-
-    - One panel per frame
-    - Wind arrows shown as anomalies (domain mean removed)
-    - Frames are minute-by-minute indices starting at start_index
-    """
+    """GIF with a fixed-size window advected by mean wind.
+    One panel per frame; arrows are anomalies (mean removed)."""
     import imageio.v2 as imageio
 
     # Helper: robustly convert a Matplotlib figure to an RGB image array across backends
