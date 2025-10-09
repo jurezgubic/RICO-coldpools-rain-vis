@@ -5,7 +5,12 @@ import numpy as np
 import xarray as xr
 import matplotlib.pyplot as plt
 
-from .physics import calculate_physics_variables, _ensure_kgkg, g
+from .physics import (
+    calculate_physics_variables,
+    _ensure_kgkg,
+    g,
+    relative_humidity_from_p_T_qv,
+)
 
 
 def _open(path: str) -> xr.Dataset:
@@ -93,6 +98,7 @@ def compute_fields_for_indices(
     use_clear_air_reference: bool = True,
     threshold_kgkg: float = 5e-5,
     rain_filename: str = "rico.r.nc",
+    compute_rh: bool = False,
 ) -> List[dict]:
     """theta_v, density, winds, buoyancy for a set of time indices at one level.
     I can crop to the same subdomain across fields.
@@ -156,6 +162,12 @@ def compute_fields_for_indices(
         # physics
         T2d, rho2d, thv2d, _B_domain = calculate_physics_variables(p2d, thl2d, ql2d, qt2d, qr2d)
 
+        # Optional: relative humidity at this level
+        rh2d = None
+        if compute_rh:
+            qv2d = np.clip(qt2d - ql2d - (qr2d if isinstance(qr2d, np.ndarray) else qr2d), 0.0, None)
+            rh2d = relative_humidity_from_p_T_qv(p2d, T2d, qv2d)
+
         # reference for buoyancy
         if use_clear_air_reference:
             thr = float(threshold_kgkg)
@@ -176,7 +188,7 @@ def compute_fields_for_indices(
         u2d = u_full[iy0:iy1, ix0:ix1]
         v2d = v_full[iy0:iy1, ix0:ix1]
 
-        results.append({
+        result_item = {
             "time_index": ti,
             "theta_v": thv2d,
             "rho": rho2d,
@@ -188,7 +200,10 @@ def compute_fields_for_indices(
             "xt": xt_sub,
             "yt": yt_sub,
             "z": z[z_index],
-        })
+        }
+        if compute_rh:
+            result_item["rh"] = rh2d
+        results.append(result_item)
 
     return results
 
@@ -201,19 +216,40 @@ def panel_plot(
     arrow_subsample: int = 8,
     arrow_scale: float = 100,
     subtract_mean_wind: bool = False,
+    scalar_field: str = "theta_v",
 ):
     n = len(results)
     ncols = 3 if n >= 3 else n
     nrows = int(np.ceil(n / ncols))
 
+    # Choose scalar to display (theta_v or RH)
+    scalar_field = scalar_field.lower()
+    if scalar_field not in ("theta_v", "rh"):
+        raise ValueError("scalar_field must be 'theta_v' or 'rh'")
+
     # color limits shared across panels
-    all_thv = np.concatenate([np.ravel(r["theta_v"]) for r in results])
-    vmin = np.nanpercentile(all_thv, 2)
-    vmax = np.nanpercentile(all_thv, 98)
+    if scalar_field == "theta_v":
+        all_vals = np.concatenate([np.ravel(r["theta_v"]) for r in results])
+    else:
+        # RH in percent for display
+        all_vals = np.concatenate([np.ravel(r.get("rh")) for r in results]) * 100.0
+    vmin = np.nanpercentile(all_vals, 2)
+    vmax = np.nanpercentile(all_vals, 98)
 
     # Choose default colormap if not specified by config
     if colormap is None:
-        colormap = "cmo.thermal" if "cmo.thermal" in plt.colormaps() else ("cmocean.thermal" if "cmocean.thermal" in plt.colormaps() else "viridis")
+        if scalar_field == "theta_v":
+            colormap = (
+                "cmo.thermal"
+                if "cmo.thermal" in plt.colormaps()
+                else ("cmocean.thermal" if "cmocean.thermal" in plt.colormaps() else "viridis")
+            )
+        else:
+            colormap = (
+                "cmo.haline"
+                if "cmo.haline" in plt.colormaps()
+                else ("cmocean.haline" if "cmocean.haline" in plt.colormaps() else "viridis")
+            )
 
     # thin the arrow field for readability
     def subsample(arr, step=arrow_subsample):
@@ -231,7 +267,13 @@ def panel_plot(
         yt = r["yt"]/1000.0
         X, Y = np.meshgrid(xt, yt)
 
-        im = ax.pcolormesh(X, Y, r["theta_v"], shading="auto", cmap=colormap, vmin=vmin, vmax=vmax)
+        if scalar_field == "theta_v":
+            scalar = r["theta_v"]
+        else:
+            if "rh" not in r:
+                raise KeyError("RH not present in results; set compute_rh=True when computing fields.")
+            scalar = r["rh"] * 100.0  # display as percent
+        im = ax.pcolormesh(X, Y, scalar, shading="auto", cmap=colormap, vmin=vmin, vmax=vmax)
 
         # Buoyancy zero contour (cold-pool edge)
         try:
@@ -259,7 +301,7 @@ def panel_plot(
 
     # Colorbar
     cbar = fig.colorbar(im, ax=axes.tolist(), shrink=0.95, pad=0.02)
-    cbar.set_label("theta_v (K)")
+    cbar.set_label("theta_v (K)" if scalar_field == "theta_v" else "RH (%)")
 
     fig.savefig(outfile, dpi=400)
     return outfile
@@ -452,6 +494,7 @@ def main(
     gif_center_km: Tuple[float, float] = (0.0, 0.0),
     gif_half_window_km: Tuple[float, float] = (2.0, 2.0),
     gif_outfile: Optional[str] = None,
+    panel_scalar: str = "theta_v",
 ):
     idx, t_values = choose_time_indices(
         start_index=start_index,
@@ -469,6 +512,7 @@ def main(
         use_clear_air_reference=use_clear_air_reference,
         threshold_kgkg=threshold_kgkg,
         rain_filename=rain_filename,
+        compute_rh=(panel_scalar.lower() == "rh"),
     )
 
     out = panel_plot(
@@ -479,6 +523,7 @@ def main(
         arrow_subsample=arrow_subsample,
         arrow_scale=arrow_scale,
         subtract_mean_wind=False,
+        scalar_field=panel_scalar,
     )
     print(f"Saved: {out}")
 
@@ -491,6 +536,7 @@ def main(
             arrow_subsample=arrow_subsample,
             arrow_scale=arrow_scale,
             subtract_mean_wind=True,
+            scalar_field=panel_scalar,
         )
         print(f"Saved: {out2}")
 

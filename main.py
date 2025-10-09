@@ -38,6 +38,8 @@ config = {
     "colormap": None,        # None is auto
     "arrow_subsample": 4,    # arrow density
     "arrow_scale": 40,      # arrow scale
+    # which scalar to color panels: 'theta_v' or 'rh'
+    "panel_scalar": "theta_v",
 
     # outputs
     "outfile": "cold_pools_panels.png",
@@ -115,6 +117,7 @@ def main():
         gif_center_km=config["gif_center_km"],
         gif_half_window_km=config["gif_half_window_km"],
         gif_outfile=config["gif_outfile"],
+        panel_scalar=config["panel_scalar"],
     )
 
     # Optional: detect and track cold pools

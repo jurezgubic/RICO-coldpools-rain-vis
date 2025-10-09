@@ -77,6 +77,37 @@ def calculate_physics_variables(p_values, theta_l_values, q_l_values, q_t_values
     return T, rho, theta_v, B
 
 
+def saturation_vapor_pressure_pa(T: np.ndarray) -> np.ndarray:
+    """Saturation vapor pressure over liquid water (Pa).
+
+    Uses an old Bolton? formula, should be okay for boundary-layer temperatures.
+    """
+    T = np.asarray(T, dtype=float)
+    Tc = T - 273.15
+    # e_s in hPa, then convert to Pa
+    e_s_hpa = 6.112 * np.exp(17.67 * Tc / (Tc + 243.5))
+    return e_s_hpa * 100.0
+
+
+def relative_humidity_from_p_T_qv(p: np.ndarray, T: np.ndarray, q_v_values: np.ndarray) -> np.ndarray:
+    """Relative humidity (0-1) from total pressure p (Pa), temperature T (K), and vapor mixing ratio q_v (kg/kg).
+
+    RH = e / e_s(T), where e = p_v = (q_v/(epsilon + q_v)) * p.
+    Values are clipped at [0, 1.05] to avoid numerical artifacts.
+    """
+    q_v = _ensure_kgkg(np.asarray(q_v_values, dtype=float))
+    p = np.asarray(p, dtype=float)
+    T = np.asarray(T, dtype=float)
+    # vapor partial pressure from mixing ratio
+    p_v = (q_v / (q_v + epsilon)) * p
+    e_s = saturation_vapor_pressure_pa(T)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        RH = p_v / e_s
+    # clip for safety
+    RH = np.clip(RH, 0.0, 1.05)
+    return RH
+
+
 def theta_from_T_p(T: np.ndarray, p: np.ndarray) -> np.ndarray:
     """Dry potential temperature from T and p (theta = T * (p0/p)^(R_d/c_pd))."""
     return np.asarray(T, dtype=float) * (p0 / np.asarray(p, dtype=float)) ** (r_d / c_pd)
