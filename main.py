@@ -40,6 +40,8 @@ config = {
     "arrow_scale": 40,      # arrow scale
     # which scalar to color panels: 'theta_v' or 'rh'
     "panel_scalar": "theta_v",
+    # show two rows: top B=0 outline, bottom rain threshold outline
+    "panel_dual_outline_rows": True,
 
     # outputs
     "outfile": "cold_pools_panels.png",
@@ -118,6 +120,9 @@ def main():
         gif_half_window_km=config["gif_half_window_km"],
         gif_outfile=config["gif_outfile"],
         panel_scalar=config["panel_scalar"],
+        dual_outline_rows=config["panel_dual_outline_rows"],
+        # use detection threshold if provided, else adaptive per figure
+        rain_outline_threshold_kgkg=config.get("qr_thresh_kgkg"),
     )
 
     # Optional: detect and track cold pools

@@ -157,7 +157,11 @@ def compute_fields_for_indices(
         # unit conversions for water species
         qt2d = _ensure_kgkg(qt2d)
         ql2d = _ensure_kgkg(ql2d)
-        qr2d = _ensure_kgkg(qr2d) if qr2d is not None else 0.0
+        if qr2d is not None:
+            qr2d = _ensure_kgkg(qr2d)
+        else:
+            # ensure array shape for plotting even without rain file
+            qr2d = np.zeros_like(qt2d)
 
         # physics
         T2d, rho2d, thv2d, _B_domain = calculate_physics_variables(p2d, thl2d, ql2d, qt2d, qr2d)
@@ -203,6 +207,8 @@ def compute_fields_for_indices(
         }
         if compute_rh:
             result_item["rh"] = rh2d
+        # always keep qr for optional rain-outline plotting
+        result_item["qr"] = qr2d
         results.append(result_item)
 
     return results
@@ -217,6 +223,8 @@ def panel_plot(
     arrow_scale: float = 100,
     subtract_mean_wind: bool = False,
     scalar_field: str = "theta_v",
+    dual_outline_rows: bool = False,
+    rain_outline_threshold_kgkg: Optional[float] = None,
 ):
     n = len(results)
     ncols = 3 if n >= 3 else n
@@ -255,52 +263,85 @@ def panel_plot(
     def subsample(arr, step=arrow_subsample):
         return arr[::step, ::step]
 
-    fig, axes = plt.subplots(nrows, ncols, figsize=(4.8*ncols, 4.8*nrows), constrained_layout=True)
+    total_rows = nrows * (2 if dual_outline_rows else 1)
+    fig, axes = plt.subplots(total_rows, ncols, figsize=(4.8*ncols, 4.8*total_rows), constrained_layout=True)
     if not isinstance(axes, np.ndarray):
         axes = np.array([axes])
-    axes = axes.ravel()
+    axes = axes.reshape(total_rows, ncols)
 
     t0 = time_values[results[0]["time_index"]]
 
-    for ax, r in zip(axes, results):
-        xt = r["xt"]/1000.0
-        yt = r["yt"]/1000.0
-        X, Y = np.meshgrid(xt, yt)
-
-        if scalar_field == "theta_v":
-            scalar = r["theta_v"]
+    # Determine rain threshold if needed
+    qr_thresh = None
+    if dual_outline_rows:
+        if rain_outline_threshold_kgkg is not None:
+            qr_thresh = float(rain_outline_threshold_kgkg)
         else:
-            if "rh" not in r:
-                raise KeyError("RH not present in results; set compute_rh=True when computing fields.")
-            scalar = r["rh"] * 100.0  # display as percent
-        im = ax.pcolormesh(X, Y, scalar, shading="auto", cmap=colormap, vmin=vmin, vmax=vmax)
+            # adaptive across all panels: 98th percentile of positive values, with a small floor
+            all_qr = np.concatenate([np.ravel(r.get("qr")) for r in results])
+            pos = all_qr[np.isfinite(all_qr) & (all_qr > 0)]
+            if pos.size > 0:
+                qr_thresh = float(np.nanpercentile(pos, 98))
+            else:
+                qr_thresh = 5e-8
 
-        # Buoyancy zero contour (cold-pool edge)
-        try:
-            cs = ax.contour(X, Y, r["B"], levels=[0.0], colors="white", linewidths=1.0)
-        except Exception:
-            cs = None
+    # Helper to render one row of panels with a given outline mode
+    def _render_row(row_axes, outline: str):
+        for idx, r in enumerate(results):
+            ax = row_axes.flat[idx]
+            xt = r["xt"]/1000.0
+            yt = r["yt"]/1000.0
+            X, Y = np.meshgrid(xt, yt)
 
-        # winds (thin sampling) plotted as arrows
-        step = max(1, int(arrow_subsample))
-        u_s = subsample(r["u"], step)
-        v_s = subsample(r["v"], step)
-        if subtract_mean_wind:
-            u_s = u_s - r["u_mean"]
-            v_s = v_s - r["v_mean"]
-        Xs = X[::step, ::step]
-        Ys = Y[::step, ::step]
-        ax.quiver(Xs, Ys, u_s, v_s, color="black", scale=arrow_scale, width=0.002)
+            if scalar_field == "theta_v":
+                scalar = r["theta_v"]
+            else:
+                if "rh" not in r:
+                    raise KeyError("RH not present in results; set compute_rh=True when computing fields.")
+                scalar = r["rh"] * 100.0  # percent
+            im = ax.pcolormesh(X, Y, scalar, shading="auto", cmap=colormap, vmin=vmin, vmax=vmax)
 
-        # Title with timestep index and relative time
-        ti = r["time_index"]
-        minutes = int(round((time_values[ti] - t0) / 60.0))
-        ax.set_title(f"timestep {ti} (t = {minutes} min), z ~ {r['z']:.1f} m")
-        ax.set_xlabel("x (km)")
-        ax.set_ylabel("y (km)")
+            # Outline
+            try:
+                if outline == "B0":
+                    ax.contour(X, Y, r["B"], levels=[0.0], colors="white", linewidths=1.0)
+                elif outline == "RAIN" and qr_thresh is not None and "qr" in r:
+                    ax.contour(X, Y, r["qr"], levels=[qr_thresh], colors="white", linewidths=1.0)
+            except Exception:
+                pass
+
+            # Wind arrows
+            step = max(1, int(arrow_subsample))
+            u_s = subsample(r["u"], step)
+            v_s = subsample(r["v"], step)
+            if subtract_mean_wind:
+                u_s = u_s - r["u_mean"]
+                v_s = v_s - r["v_mean"]
+            Xs = X[::step, ::step]
+            Ys = Y[::step, ::step]
+            ax.quiver(Xs, Ys, u_s, v_s, color="black", scale=arrow_scale, width=0.002)
+
+            # Title with timestep index and relative time
+            ti = r["time_index"]
+            minutes = int(round((time_values[ti] - t0) / 60.0))
+            ax.set_title(f"timestep {ti} (t = {minutes} min), z ~ {r['z']:.1f} m")
+            ax.set_xlabel("x (km)")
+            ax.set_ylabel("y (km)")
+
+        # hide any unused axes in this row
+        for j in range(len(results), row_axes.size):
+            row_axes.flat[j].axis('off')
+        return im
+
+    # Render top row (B=0)
+    im = _render_row(axes[0:nrows, :], outline="B0")
+    # Render bottom row (rain threshold) if requested
+    if dual_outline_rows:
+        _render_row(axes[nrows:2*nrows, :], outline="RAIN")
 
     # Colorbar
-    cbar = fig.colorbar(im, ax=axes.tolist(), shrink=0.95, pad=0.02)
+    # Flatten axes for colorbar association
+    cbar = fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.95, pad=0.02)
     cbar.set_label("theta_v (K)" if scalar_field == "theta_v" else "RH (%)")
 
     fig.savefig(outfile, dpi=400)
@@ -495,6 +536,8 @@ def main(
     gif_half_window_km: Tuple[float, float] = (2.0, 2.0),
     gif_outfile: Optional[str] = None,
     panel_scalar: str = "theta_v",
+    dual_outline_rows: bool = False,
+    rain_outline_threshold_kgkg: Optional[float] = None,
 ):
     idx, t_values = choose_time_indices(
         start_index=start_index,
@@ -524,6 +567,8 @@ def main(
         arrow_scale=arrow_scale,
         subtract_mean_wind=False,
         scalar_field=panel_scalar,
+        dual_outline_rows=dual_outline_rows,
+        rain_outline_threshold_kgkg=rain_outline_threshold_kgkg,
     )
     print(f"Saved: {out}")
 
@@ -537,6 +582,8 @@ def main(
             arrow_scale=arrow_scale,
             subtract_mean_wind=True,
             scalar_field=panel_scalar,
+            dual_outline_rows=dual_outline_rows,
+            rain_outline_threshold_kgkg=rain_outline_threshold_kgkg,
         )
         print(f"Saved: {out2}")
 
